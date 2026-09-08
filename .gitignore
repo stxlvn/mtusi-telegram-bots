@@ -508,3 +508,10 @@ cython_debug/
 /credentials.json
 /token.json
 /uv.lock
+
+# Runtime state / generated at deploy time (this fork's additions)
+lesson_debug_*.png
+log.txt
+topics.json
+pinned_schedule.json
+state.json

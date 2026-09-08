@@ -329,13 +329,11 @@ class MTUCIAuthenticator:
         """Fill form field with retry logic."""
         for attempt in range(max_retries):
             try:
-                field = await page.query_selector(selector)
-                if field:
-                    await field.click()
-                    await page.keyboard.press("Control+A")
-                    await page.keyboard.press("Backspace")
-                    await field.fill(value)
-                    return
+                # page.fill() re-resolves the selector and waits for actionability
+                # itself; a query_selector'd handle can go stale between the click
+                # and the keyboard events if the form re-renders (Keycloak/React).
+                await page.fill(selector, value)
+                return
             except PlaywrightError as e:
                 if attempt == max_retries - 1:
                     self._raise_validation_error(field_name, e)
@@ -374,11 +372,12 @@ class MTUCIAuthenticator:
 
     async def _handle_form_submission(self, page: Page) -> None:
         """Handle form submission and validation."""
-        submit_button = await page.query_selector("#login-submit-button")
-        if not submit_button:
-            self._raise_auth_error(AuthenticationError.SUBMIT_BUTTON_NOT_FOUND)
-
-        await submit_button.click()
+        try:
+            # page.click() re-resolves the selector right before clicking instead
+            # of clicking a handle grabbed earlier, which can go stale/detached.
+            await page.click("#login-submit-button", timeout=10_000)
+        except PlaywrightError as e:
+            self._raise_auth_error(AuthenticationError.SUBMIT_BUTTON_NOT_FOUND, error=e)
 
     async def _validate_auth_result(self, page: Page) -> None:
         """Validate authentication result."""

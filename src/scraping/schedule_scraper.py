@@ -1,6 +1,7 @@
 # src/scraping/schedule_scraper.py
 
 import asyncio
+import os
 from datetime import UTC
 from datetime import datetime
 from datetime import time
@@ -17,6 +18,8 @@ from src.scraping.auth import AuthConfig
 from src.scraping.auth import MTUCIAuthenticator
 
 logger = structlog.get_logger(__name__)
+
+DEBUG_SCREENSHOTS = os.environ.get("SCRAPING_DEBUG_SCREENSHOTS", "").lower() in ("1", "true", "yes")
 
 
 class ScrapingError(ApplicationError):
@@ -88,6 +91,13 @@ class ScheduleParser:
                 self._raise_parsing_error(error_message)
 
             date_str = parts[1].strip()
+
+            # Site now renders the header as numeric "07.08.2026" instead of
+            # the worded "13 ноября 2024" format this parser was written for.
+            if "." in date_str:
+                day_s, month_s, year_s = date_str.split(".")
+                return datetime(int(year_s), int(month_s), int(day_s), tzinfo=UTC)
+
             # Convert month name to number
             ru_months = {
                 "января": 1,
@@ -247,11 +257,12 @@ class ScheduleParser:
     async def _parse_lesson(self, lesson_el, base_date: datetime) -> ScheduleEvent:
         """Parse single lesson element."""
         try:
-            # Take a screenshot of the lesson element for debugging
-            try:
-                await lesson_el.screenshot(path=f"lesson_debug_{base_date.date()}.png")
-            except Exception as e:
-                self._logger.debug(f"Failed to take lesson screenshot: {e!s}")
+            # Take a screenshot of the lesson element for debugging (opt-in, off by default)
+            if DEBUG_SCREENSHOTS:
+                try:
+                    await lesson_el.screenshot(path=f"lesson_debug_{base_date.date()}.png")
+                except Exception as e:
+                    self._logger.debug(f"Failed to take lesson screenshot: {e!s}")
 
             # Get HTML content for debugging
             try:
