@@ -45,12 +45,6 @@ MSK_OFFSET = timedelta(hours=3)
 
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
-LESSON_ICONS = {
-    "Лекция": "📖",
-    "Практическое занятие": "✏️",
-    "Лабораторная работа": "🔬",
-}
-
 
 def msk_now():
     return datetime.now(UTC) + MSK_OFFSET
@@ -124,6 +118,8 @@ def tg_api(method, **params):
     return result["result"]
 
 
+# Not called from main() below — kept as a public helper for other tools that post
+# into per-subject topics (e.g. a companion attendance bot).
 def ensure_topic(subject):
     topics = load_topics()
     if subject in topics:
@@ -134,24 +130,6 @@ def ensure_topic(subject):
     save_topics(topics)
     print(f"created topic for '{subject}' -> {thread_id}", flush=True)
     return thread_id
-
-
-def build_subject_message(subject, day_events, target_date):
-    weekday = WEEKDAYS[target_date.weekday()]
-    lines = [f"📅 <b>{target_date.strftime('%d.%m.%Y')} ({weekday})</b>  {GROUP_LABEL}", ""]
-    for e in sorted(day_events, key=lambda x: x.start_time):
-        icon = LESSON_ICONS.get(e.lesson_type.value, "📌")
-        lines.append(
-            f"{icon} <b>{format_time(e.start_time)}-{format_time(e.end_time)}</b> {e.lesson_type.value}\n"
-            f"    👤 {e.teacher}\n"
-            f"    📍 {e.location}"
-        )
-    return "\n".join(lines)
-
-
-def send_to_topic(thread_id, text):
-    tg_api("sendMessage", chat_id=TELEGRAM_CHAT_ID, message_thread_id=thread_id,
-           text=text, parse_mode="HTML")
 
 
 def send_general(text):
@@ -165,13 +143,6 @@ def send_debug(text):
         tg_api("sendMessage", chat_id=DEBUG_CHAT_ID, text=text[:4000])
     except Exception as e:
         print(f"send_debug failed: {e}", flush=True)
-
-
-def group_by_subject(events):
-    by_subject = {}
-    for e in events:
-        by_subject.setdefault(e.subject, []).append(e)
-    return by_subject
 
 
 def escape_html(text):
@@ -245,15 +216,6 @@ def main():
     if not day_events:
         print("no lessons today, skipping post", flush=True)
         return
-
-    for subject, subj_events in group_by_subject(day_events).items():
-        try:
-            thread_id = ensure_topic(subject)
-            message = build_subject_message(subject, subj_events, target_date)
-            send_to_topic(thread_id, message)
-            print(f"posted '{subject}'", flush=True)
-        except Exception as e:
-            print(f"FAILED for subject '{subject}': {e}", flush=True)
 
     try:
         post_and_pin_digest(day_events, target_date)
