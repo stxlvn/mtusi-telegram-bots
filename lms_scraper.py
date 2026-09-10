@@ -5,8 +5,10 @@ and publish them into the matching Telegram subject topics.
 lms.mtuci.ru sits behind a slider-CAPTCHA shield that binds clearance to
 IP + browser fingerprint, so it can only be reached with a real Firefox engine
 using cookies exported from a browser that solved the CAPTCHA while routed
-through this server's own IP (its VPN endpoint). Refreshed by the owner via
-the bot's /lms command. On expiry the owner is DM'd.
+through this server's own IP (its VPN endpoint). Cookies are refreshed by the
+owner through bot.py (/links -> "Обновить cookie LMS"); on expiry the owner is DM'd.
+
+Not a standalone job — bot.py's main loop spawns this once a day and on demand.
 """
 import asyncio
 import os
@@ -17,7 +19,7 @@ from playwright.async_api import async_playwright
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
-import attendance_bot as bot  # noqa: E402
+import bot  # noqa: E402
 
 SESSION_FILE = bot.LMS_SESSION_FILE
 COURSES_URL = "https://lms.mtuci.ru/lms/my/courses.php"
@@ -99,7 +101,7 @@ def main():
     if result is None:
         print("LMS session expired", flush=True)
         notify_owner(cfg, "⚠️ LMS-сессия истекла — автопарсер конференций не может зайти.\n"
-                          "Обнови cookie: /lms в личке боту.")
+                          "Обнови cookie: /links → 🔄 Обновить cookie LMS")
         return
 
     subjects = list(bot.load_topic_subjects(cfg))

@@ -23,7 +23,20 @@ from telegram_post import tg_api as schedule_tg_api  # noqa: E402
 LMS_SESSION_FILE = os.path.join(DATA_DIR, "lms_session.json")
 LMS_SCRAPER = os.path.join(SCRIPT_DIR, "lms_scraper.py")
 LMS_LOG = os.path.join(DATA_DIR, "lms_scraper.log")
+SCHEDULE_SCRIPT = os.path.join(SCRIPT_DIR, "telegram_post.py")
+SCHEDULE_LOG = os.path.join(DATA_DIR, "schedule.log")
 VENV_PY = sys.executable
+
+# daily jobs folded into the main loop (no cron); MSK HH:MM triggers
+LMS_SCRAPE_AT = (7, 35)
+SCHEDULE_POST_AT = (8, 0)
+
+
+def spawn(script, *args, log=None):
+    """Run a sibling script detached, so the poll loop keeps serving updates."""
+    out = open(log, "a") if log else subprocess.DEVNULL
+    subprocess.Popen([VENV_PY, script, *args], cwd=SCRIPT_DIR,
+                     stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
 
 
 def _require_env(name):
@@ -533,9 +546,7 @@ def handle_conf_link_callback(cfg, cq, state):
         ack()
     elif data == "cl:scan":
         try:
-            subprocess.Popen([VENV_PY, LMS_SCRAPER, "--report"], cwd=SCRIPT_DIR,
-                             stdout=open(LMS_LOG, "a"), stderr=subprocess.STDOUT,
-                             start_new_session=True)
+            spawn(LMS_SCRAPER, "--report", log=LMS_LOG)
             ack("Запущено — результат придёт в личку через пару минут")
         except Exception as e:
             ack(f"Не вышло: {e}")
@@ -623,9 +634,7 @@ def handle_owner_command(cfg, msg, roster, student_map, state, rollcall):
             state["pending_lms_cookies"] = None
             save_json(cfg["state_file"], state)
             try:
-                subprocess.Popen([VENV_PY, LMS_SCRAPER, "--report"], cwd=SCRIPT_DIR,
-                                 stdout=open(LMS_LOG, "a"), stderr=subprocess.STDOUT,
-                                 start_new_session=True)
+                spawn(LMS_SCRAPER, "--report", log=LMS_LOG)
             except Exception:
                 pass
             reply = (f"✅ Cookie обновлены ({len(cookies)} шт). Парсер запущен — "
@@ -665,7 +674,9 @@ def handle_owner_command(cfg, msg, roster, student_map, state, rollcall):
             f"Зарегистрировано: {len(done)}/{len(roster)}\n"
             f"Кеш расписания на: {state.get('date') or '—'}\n"
             f"Пар сегодня в кеше: {len(lessons) if lessons is not None else '—'}\n"
-            f"Последняя попытка обновления: {state.get('last_attempt') or '—'}"
+            f"Дайджест расписания постился: {state.get('last_digest') or '—'}\n"
+            f"Парсер LMS запускался: {state.get('last_lms_scrape') or '—'}\n"
+            f"LMS-сессия: {lms_session_age(cfg)}"
         )
     elif cmd == "/roster":
         reply = f"✅ Отметились ({len(done)}):\n" + ("\n".join(done) if done else "—")
@@ -785,7 +796,16 @@ def main():
     participants = load_participants(cfg)
     offset = load_offset(cfg)
 
-    print(f"attendance-bot started, roster={len(roster)} students, participants={len(participants)}", flush=True)
+    # a mid-day restart must not replay today's daily jobs: if we're already past
+    # a job's trigger time and it has never run, mark it done for today.
+    _now = msk_now()
+    _today = _now.date().isoformat()
+    for key, at in (("last_lms_scrape", LMS_SCRAPE_AT), ("last_digest", SCHEDULE_POST_AT)):
+        if key not in state and (_now.hour, _now.minute) >= at:
+            state[key] = _today
+    save_json(cfg["state_file"], state)
+
+    print(f"bot started, roster={len(roster)} students, participants={len(participants)}", flush=True)
 
     while True:
         try:
@@ -805,6 +825,20 @@ def main():
                 save_json(cfg["state_file"], state)
 
             today = msk_now().date().isoformat()
+            hm = (now.hour, now.minute)
+
+            if state.get("last_lms_scrape") != today and hm >= LMS_SCRAPE_AT:
+                state["last_lms_scrape"] = today
+                save_json(cfg["state_file"], state)
+                print("spawning daily LMS scrape", flush=True)
+                spawn(LMS_SCRAPER, log=LMS_LOG)
+
+            if state.get("last_digest") != today and hm >= SCHEDULE_POST_AT and now.hour < 12:
+                state["last_digest"] = today
+                save_json(cfg["state_file"], state)
+                print("spawning daily schedule digest", flush=True)
+                spawn(SCHEDULE_SCRIPT, log=SCHEDULE_LOG)
+
             if state.get("last_conf_check") != today:
                 state["last_conf_check"] = today
                 save_json(cfg["state_file"], state)
@@ -813,7 +847,7 @@ def main():
                     body = "\n".join(f"• {s} — {r}" for s, r in dead)
                     tg_api(cfg, "sendMessage", chat_id=cfg["owner_telegram_id"],
                            text=f"⚠️ Возможно, ссылки на конференции недоступны:\n{body}\n\n"
-                                f"Обнови через /link Предмет https://…")
+                                f"Обнови через /links → выбери предмет")
 
             updates = tg_api(cfg, "getUpdates", offset=offset, timeout=20,
                               allowed_updates=json.dumps(["message", "callback_query"]))
