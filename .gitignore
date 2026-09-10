@@ -509,9 +509,26 @@ cython_debug/
 /token.json
 /uv.lock
 
-# Runtime state / generated at deploy time (this fork's additions)
+# --- this project: runtime state, secrets, PII (never commit) ---
 lesson_debug_*.png
+*.log
 log.txt
-topics.json
-pinned_schedule.json
-state.json
+
+# all per-deployment state & data: roster (real ФИО+UUID), student_map / participants
+# (telegram IDs = PII), topics map, LMS session cookies, bot offset, pin state, etc.
+/data/
+
+# venvs
+/venv/
+/userbot_venv/
+
+# Telethon userbot session = FULL access to a personal Telegram account.
+# Everything here is machine-local (session, api_hash, dumped PII); only the README ships.
+/userbot/*
+!/userbot/README.md
+
+# legacy flat paths (moved into data/)
+/topics.json
+/pinned_schedule.json
+/state.json
+/config.json

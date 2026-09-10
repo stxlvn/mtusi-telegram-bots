@@ -38,8 +38,10 @@ TELEGRAM_CHAT_ID = int(require_env("TELEGRAM_CHAT_ID"))
 # so the group only ever sees a short friendly notice. Leave unset to disable.
 DEBUG_CHAT_ID = int(os.environ["DEBUG_CHAT_ID"]) if os.environ.get("DEBUG_CHAT_ID") else None
 
-TOPICS_FILE = os.environ.get("TOPICS_FILE", os.path.join(SCRIPT_DIR, "topics.json"))
-PIN_STATE_FILE = os.environ.get("PIN_STATE_FILE", os.path.join(SCRIPT_DIR, "pinned_schedule.json"))
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(SCRIPT_DIR, "data"))
+os.makedirs(DATA_DIR, exist_ok=True)
+TOPICS_FILE = os.environ.get("TOPICS_FILE", os.path.join(DATA_DIR, "topics.json"))
+PIN_STATE_FILE = os.environ.get("PIN_STATE_FILE", os.path.join(DATA_DIR, "pinned_schedule.json"))
 
 MSK_OFFSET = timedelta(hours=3)
 

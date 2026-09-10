@@ -1,85 +1,70 @@
-# MTUCI Telegram Schedule Bot 📅
+# MTUSI Telegram bots (БАП2551)
 
-Каждое утро бот заходит в личный кабинет МТУСИ (lk.mtuci.ru), забирает расписание на сегодня и постит его в Telegram-группу одним закреплённым сообщением-таблицей (нативная таблица Telegram) со всем днём целиком. Если пар нет — бот молчит.
+Three small Telegram automations for one МТУСИ study-group chat, sharing one bot
+account, one `.env` and one МТУСИ login:
 
-## Credits 🙏
+| component | what it does | how it runs |
+|---|---|---|
+| **`telegram_post.py`** | every morning logs into lk.mtuci.ru, scrapes today's lessons and posts them as one **pinned native Telegram table** (Время / Предмет / Преподаватель / Аудитория) into the announcements chat; unpins yesterday's; posts nothing on empty days | cron, once a day |
+| **`attendance_bot.py`** | self-check-in for lessons: at each lesson's start time posts a per-student button list into the subject's forum topic; students tap their name (identity verified against the group's contact list via a userbot); at lesson end posts a present/absent summary. Plus an **owner-only button panel** (`/links` in a DM) for the per-subject conference links | systemd service (long-poll) |
+| **`lms_scraper.py`** | walks lms.mtuci.ru (Moodle), pulls each course's Контур.Толк / BBB conference link and pins it (as a **▶️ Подключиться** button) into the matching subject topic; only re-posts when the link changed | cron, once a day |
 
-Слой авторизации и парсинга расписания (Playwright-логин и парсинг lk.mtuci.ru) взят из проекта [**TheFoxKD/CalendarMTUSI**](https://github.com/TheFoxKD/CalendarMTUSI) (MIT License) — изначально это была синхронизация с Google Calendar. Этот форк оставляет тот же скрапер (с парой багфиксов, см. ниже) и заменяет вывод в Google Calendar на постинг в Telegram.
+## Credits
 
-## Что умеет 🚀
+The lk.mtuci.ru login + schedule parser (`src/`) is from
+[**TheFoxKD/CalendarMTUSI**](https://github.com/TheFoxKD/CalendarMTUSI) (MIT) — originally
+a Google Calendar sync. This project keeps that scraper (with two bugfixes, below) and
+replaces the calendar output with the Telegram bots above.
 
-- Логинится в lk.mtuci.ru и парсит сегодняшние пары (предмет, время, преподаватель, аудитория)
-- Постит единое расписание дня **настоящей нативной таблицей Telegram** (через `sendRichMessage` из Bot API) в чат/топик объявлений, закрепляет его и открепляет вчерашнее
-- Если пар нет — ничего не постит
-- При сбое логина делает до 3 повторных попыток с паузой, чтобы пережить временные глюки lk.mtuci.ru
-- При ошибке: в группу уходит короткое дружелюбное уведомление, а в отдельный приватный чат (опционально) — полный traceback для отладки
+Changes to the vendored code:
+- `schedule_scraper.py` `_get_current_date()` — the site's date header switched from
+  `"13 ноября 2024"` to numeric `"07.08.2026"`, which broke the parser.
+- `auth.py` — the login form fill/submit grabbed an element handle and clicked it,
+  which went stale if the Keycloak form re-rendered mid-interaction; now uses
+  `page.fill()` / `page.click()` (re-resolve the selector right before acting).
+- per-lesson debug screenshots are opt-in (`SCRAPING_DEBUG_SCREENSHOTS`); `LOG_LEVEL`
+  is configurable (upstream logged every parsed lesson's raw HTML).
+- `src/my_calendar/` (Google Calendar) is unused dead code, kept for reference.
 
-## Отличия от upstream
-
-- Синхронизация с Google Calendar (`src/my_calendar/`, код остался в репозитории, но не используется) заменена на `telegram_post.py`
-- Исправлен `_get_current_date()` в `schedule_scraper.py`: заголовок на сайте сменился со словесной даты (`"13 ноября 2024"`) на числовую (`"07.08.2026"`), из-за чего оригинальный парсер падал
-- Исправлено заполнение/сабмит формы логина в `auth.py`: раньше код брал ссылку на элемент и кликал/печатал в него, что могло сломаться, если форма Keycloak успевала перерендериться; заменено на `page.fill()`/`page.click()`, которые сами находят актуальный элемент перед действием
-- Скриншот каждой пары для отладки (`lesson_debug_*.png`) теперь опционален через `SCRAPING_DEBUG_SCREENSHOTS`, а не включён всегда
-- Настраиваемый уровень логирования (`LOG_LEVEL`, по умолчанию `INFO`) — в upstream логирование не фильтровалось по уровню, и в stdout сыпался сырой HTML каждой распарсенной пары
-
-## Установка 🛠️
-
-```bash
-git clone https://github.com/stxlvn/mtusi-schedule-bot.git
-cd mtusi-schedule-bot
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-playwright install --with-deps chromium
-
-cp .env.example .env
-# заполните .env: логин/пароль МТУСИ, GROUP_LABEL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-```
-
-Вся конфигурация — через переменные окружения, полный список см. в [`.env.example`](.env.example). `.env` подхватывается автоматически из папки скрипта, поэтому запуск руками, через cron или через systemd работает одинаково.
-
-## Запуск
-
-Разовый запуск (рассчитан на ежедневный вызов, например через cron):
+## Setup
 
 ```bash
-python telegram_post.py
+git clone https://github.com/stxlvn/mtusi-telegram-bots.git
+cd mtusi-telegram-bots
+python -m venv venv && ./venv/bin/pip install -r requirements.txt
+./venv/bin/playwright install --with-deps firefox chromium
+
+cp .env.example .env      # fill in МТУСИ creds, bot token, chat id, owner id
 ```
 
-Пример строки в crontab (в 8:00 по времени сервера):
+Everything is env-configured — see [`.env.example`](.env.example). `.env` and the whole
+`data/` dir (roster, cookies, state — real personal data) are gitignored. The userbot
+session for identity checks + LMS cookies is set up separately, see
+[`userbot/README.md`](userbot/README.md).
 
-```
-0 8 * * * cd /path/to/mtusi-schedule-bot && ./venv/bin/python telegram_post.py >> log.txt 2>&1
-```
-
-## Как получить `TELEGRAM_CHAT_ID`
-
-Добавьте бота в свою группу администратором (нужны права на закрепление сообщений), отправьте любое сообщение, затем посмотрите `id` чата (отрицательное число для супергрупп) через `https://api.telegram.org/bot<TOKEN>/getUpdates`.
-
-## Структура 📁
-
-```
-.
-├── telegram_post.py     # точка входа — постинг в Telegram (код этого форка)
-├── src/
-│   ├── core/             # логирование, исключения (из upstream)
-│   ├── models/            # ScheduleEvent / Location / LessonType (из upstream)
-│   ├── my_calendar/       # неиспользуемая синхронизация с Google Calendar (из upstream)
-│   └── scraping/          # логин + парсинг расписания МТУСИ (из upstream, с патчами)
-├── tests/
-├── .env.example
-└── requirements.txt
-```
-
-## Разработка
+## Running
 
 ```bash
-pip install -r requirements-dev.txt
-pre-commit install
-pytest
-ruff check src
+# schedule digest — cron, e.g. 08:00
+0 8 * * *  cd /path/mtusi-telegram-bots && ./venv/bin/python telegram_post.py >> data/schedule.log 2>&1
+
+# LMS conference links — cron, e.g. 07:35
+35 7 * * * cd /path/mtusi-telegram-bots && ./venv/bin/python lms_scraper.py >> data/lms_scraper.log 2>&1
+
+# attendance bot — systemd service
+ExecStart=/path/mtusi-telegram-bots/venv/bin/python /path/mtusi-telegram-bots/attendance_bot.py
 ```
 
-## Лицензия 📄
+### lms.mtuci.ru CAPTCHA
 
-[MIT License](LICENSE), унаследована от upstream-проекта.
+Moodle sits behind a slider-CAPTCHA shield that binds clearance to **IP + browser
+TLS/JA3 fingerprint** — cookies transplanted from another machine/browser still get
+challenged. What works: `lms_scraper.py` drives a Playwright **Firefox** engine with the
+exact phone Firefox UA + cookies exported from that phone's Firefox *after solving the
+CAPTCHA while the phone is on this server's VPN* (so the shield clears the server's own
+IP). The owner refreshes those cookies through the bot's `/links` → **🔄 Обновить cookie
+LMS** button; on expiry the bot DMs the owner.
+
+## License
+
+[MIT](LICENSE), inherited from the upstream project.
