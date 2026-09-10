@@ -522,10 +522,13 @@ def handle_conf_link_callback(cfg, cq, state):
         save_json(cfg["state_file"], state)
         tg_api(cfg, "editMessageText", chat_id=chat_id, message_id=message_id, parse_mode="HTML",
                text="🔄 <b>Обновление cookie LMS</b>\n\n"
-                    "1. Подключи телефон к VPN dim-wiluite\n"
-                    "2. В Firefox открой lms.mtuci.ru, пройди капчу, залогинься\n"
+                    "1. Подключи телефон к VPN сервера (капча привязана к IP)\n"
+                    "2. В <b>том же</b> браузере, что и обычно, открой lms.mtuci.ru, "
+                    "пройди капчу, залогинься\n"
                     "3. Не отключая VPN — экспортируй cookie-файл для lms.mtuci.ru\n"
-                    "4. Пришли <b>содержимое файла</b> следующим сообщением\n\n"
+                    "4. Пришли <b>содержимое файла</b> следующим сообщением.\n"
+                    "Если UA твоего браузера мог смениться — добавь первой строкой "
+                    "строку <code>Mozilla/5.0 …</code> (свой User-Agent).\n\n"
                     "(или /cancel)")
         ack()
     elif data == "cl:scan":
@@ -609,7 +612,12 @@ def handle_owner_command(cfg, msg, roster, student_map, state, rollcall):
         else:
             sess = load_json(LMS_SESSION_FILE, {}) or {}
             sess["cookies"] = cookies
-            sess.setdefault("ua", "Mozilla/5.0 (Android 12; Mobile; rv:155.0) Gecko/155.0 Firefox/155.0")
+            ua_line = next((ln.strip() for ln in (msg.get("text") or "").splitlines()
+                            if ln.strip().startswith("Mozilla/")), None)
+            if ua_line:
+                sess["ua"] = ua_line
+            sess.setdefault("ua", os.environ.get(
+                "LMS_UA", "Mozilla/5.0 (Android 12; Mobile; rv:155.0) Gecko/155.0 Firefox/155.0"))
             sess["updated"] = msk_now().isoformat()
             save_json(LMS_SESSION_FILE, sess)
             state["pending_lms_cookies"] = None

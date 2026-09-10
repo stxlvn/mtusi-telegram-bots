@@ -40,7 +40,9 @@ async def scrape(session):
     found = {}  # course_name -> conference url
     async with async_playwright() as pw:
         br = await pw.firefox.launch(headless=True)
-        ctx = await br.new_context(user_agent=session["ua"],
+        ua = session.get("ua") or os.environ.get(
+            "LMS_UA", "Mozilla/5.0 (Android 12; Mobile; rv:155.0) Gecko/155.0 Firefox/155.0")
+        ctx = await br.new_context(user_agent=ua,
                                    viewport={"width": 1280, "height": 2200})
         await ctx.add_cookies(session["cookies"])
         page = await ctx.new_page()
