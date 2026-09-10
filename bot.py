@@ -30,6 +30,10 @@ VENV_PY = sys.executable
 # daily jobs folded into the main loop (no cron); MSK HH:MM triggers
 LMS_SCRAPE_AT = (7, 35)
 SCHEDULE_POST_AT = (8, 0)
+# keep the LMS session warm: Moodle idles out in ~2h, so ping under that.
+# The shield clearance (IP + TLS fingerprint bound) does not time out on its own —
+# only a human re-solves it, and only when the server IP changes (reboot).
+LMS_KEEPALIVE_EVERY = timedelta(minutes=90)
 
 
 def spawn(script, *args, log=None):
@@ -446,20 +450,38 @@ def remove_conf_link(cfg, subject_query):
     return f"Удалил ссылку для «{subject}»."
 
 
+LMS_COOKIE_NAMES = ("__cap_", "__cap_p_", "__hash_", "MoodleSession")
+
+
 def parse_netscape_cookies(text, domains=("lms.mtuci.ru", ".lms.mtuci.ru")):
-    out = []
+    """Accept a Netscape cookie file (tabs OR spaces — Telegram eats tabs) or a
+    plain `name=value; name2=value2` header string."""
+    out = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split("\t")
-        if len(parts) != 7:
-            continue
-        domain, _flag, path, _secure, _exp, name, value = parts
-        if domain in domains:
-            out.append({"name": name, "value": value,
-                        "domain": domain.lstrip("."), "path": path or "/"})
-    return out
+        # Netscape: domain <flag> path <secure> <expiry> name value
+        # first 6 fields never contain whitespace; split keeps the value intact
+        parts = re.split(r"[ \t]+", line, maxsplit=6)
+        if len(parts) == 7 and parts[1] in ("TRUE", "FALSE"):
+            domain, _flag, path, _secure, _exp, name, value = parts
+            d = domain.lstrip(".")
+            # exact lms.mtuci.ru cookies, plus the shield/CAPTCHA cookies that
+            # get set on the parent .mtuci.ru domain
+            if domain in domains or (d.endswith("mtuci.ru") and name in LMS_COOKIE_NAMES):
+                out[name] = {"name": name, "value": value,
+                             "domain": domain if d.endswith("mtuci.ru") else "lms.mtuci.ru",
+                             "path": path or "/"}
+    if not out:  # fallback: "name=value; name2=value2"
+        for pair in re.split(r";\s*", text.strip()):
+            if "=" in pair:
+                name, _, value = pair.partition("=")
+                name = name.strip().removeprefix("Cookie:").strip()
+                if name in LMS_COOKIE_NAMES:
+                    out[name] = {"name": name, "value": value.strip(),
+                                 "domain": "lms.mtuci.ru", "path": "/"}
+    return list(out.values())
 
 
 def lms_session_age(cfg):
@@ -535,11 +557,14 @@ def handle_conf_link_callback(cfg, cq, state):
         save_json(cfg["state_file"], state)
         tg_api(cfg, "editMessageText", chat_id=chat_id, message_id=message_id, parse_mode="HTML",
                text="🔄 <b>Обновление cookie LMS</b>\n\n"
+                    "Нужно только когда сменился IP сервера (перезагрузка). "
+                    "Пароль от МТУСИ и протухшую сессию Moodle бот обновляет сам.\n\n"
                     "1. Подключи телефон к VPN сервера (капча привязана к IP)\n"
                     "2. В <b>том же</b> браузере, что и обычно, открой lms.mtuci.ru, "
                     "пройди капчу, залогинься\n"
                     "3. Не отключая VPN — экспортируй cookie-файл для lms.mtuci.ru\n"
-                    "4. Пришли <b>содержимое файла</b> следующим сообщением.\n"
+                    "4. Пришли <b>содержимое файла</b> следующим сообщением "
+                    "(табы или пробелы — не важно).\n"
                     "Если UA твоего браузера мог смениться — добавь первой строкой "
                     "строку <code>Mozilla/5.0 …</code> (свой User-Agent).\n\n"
                     "(или /cancel)")
@@ -619,7 +644,14 @@ def handle_owner_command(cfg, msg, roster, student_map, state, rollcall):
     if state.get("pending_lms_cookies") and cmd not in ("/cancel", "/help", "/start"):
         cookies = parse_netscape_cookies(msg.get("text") or "")
         if not cookies:
-            reply = "Не нашёл cookie для lms.mtuci.ru в тексте. Пришли содержимое cookie-файла или /cancel."
+            reply = ("Не нашёл cookie lms.mtuci.ru в тексте. Пришли содержимое "
+                     "cookie-файла (строки вида <code>lms.mtuci.ru\tFALSE\t/\t…</code>) "
+                     "или строку <code>MoodleSession=…; __cap_=…; __hash_=…</code>, "
+                     "либо /cancel.")
+        elif not any(c["name"] == "MoodleSession" for c in cookies):
+            names = ", ".join(c["name"] for c in cookies)
+            reply = (f"Нашёл только: {names}. Нет <code>MoodleSession</code> — "
+                     "без неё LMS не пустит. Экспортируй cookie заново после входа в Moodle.")
         else:
             sess = load_json(LMS_SESSION_FILE, {}) or {}
             sess["cookies"] = cookies
@@ -632,6 +664,8 @@ def handle_owner_command(cfg, msg, roster, student_map, state, rollcall):
             sess["updated"] = msk_now().isoformat()
             save_json(LMS_SESSION_FILE, sess)
             state["pending_lms_cookies"] = None
+            state["lms_captcha_notified"] = None
+            state["last_lms_keepalive"] = msk_now().isoformat()
             save_json(cfg["state_file"], state)
             try:
                 spawn(LMS_SCRAPER, "--report", log=LMS_LOG)
@@ -677,6 +711,8 @@ def handle_owner_command(cfg, msg, roster, student_map, state, rollcall):
             f"Дайджест расписания постился: {state.get('last_digest') or '—'}\n"
             f"Парсер LMS запускался: {state.get('last_lms_scrape') or '—'}\n"
             f"LMS-сессия: {lms_session_age(cfg)}"
+            + ("\n⚠️ LMS: капча не пройдена — нужно обновить cookie (/links)"
+               if state.get("lms_captcha_notified") else "")
         )
     elif cmd == "/roster":
         reply = f"✅ Отметились ({len(done)}):\n" + ("\n".join(done) if done else "—")
@@ -832,6 +868,15 @@ def main():
                 save_json(cfg["state_file"], state)
                 print("spawning daily LMS scrape", flush=True)
                 spawn(LMS_SCRAPER, log=LMS_LOG)
+
+            if os.path.exists(LMS_SESSION_FILE):
+                last_ka = state.get("last_lms_keepalive")
+                due = (not last_ka or
+                       now - datetime.fromisoformat(last_ka) >= LMS_KEEPALIVE_EVERY)
+                if due:
+                    state["last_lms_keepalive"] = now.isoformat()
+                    save_json(cfg["state_file"], state)
+                    spawn(LMS_SCRAPER, "--keepalive", log=LMS_LOG)
 
             if state.get("last_digest") != today and hm >= SCHEDULE_POST_AT and now.hour < 12:
                 state["last_digest"] = today
