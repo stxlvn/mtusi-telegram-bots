@@ -2,35 +2,46 @@
 """Scrape lms.mtuci.ru (Moodle) for per-course Контур.Толк / BBB conference links
 and publish them into the matching Telegram subject topics.
 
-lms.mtuci.ru sits behind a slider-CAPTCHA shield that binds clearance to
-IP + browser fingerprint, so it can only be reached with a real Firefox engine
-using cookies exported from a browser that solved the CAPTCHA while routed
-through this server's own IP (its VPN endpoint). Cookies are refreshed by the
-owner through bot.py (/links -> "Обновить cookie LMS"); on expiry the owner is DM'd.
+lms.mtuci.ru sits behind an anti-bot shield that hits non-Russian IPs with a
+slider CAPTCHA. This scraper routes through a Russian SOCKS proxy (``LMS_PROXY``);
+from a RU IP there is no CAPTCHA, so a plain HTTP session logs in through the
+shared MTUCI Keycloak SSO (``MTUCI_EMAIL`` / ``MTUCI_PASSWORD``) and reads the
+course list via Moodle's AJAX endpoint. No browser, no cookie file to maintain.
 
-Not a standalone job — bot.py's main loop spawns this once a day and on demand.
+bot.py's main loop spawns this once a day; also runnable standalone.
 """
-import asyncio
+import html
 import os
 import re
 import sys
 
-from playwright.async_api import async_playwright
+import requests
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 import bot  # noqa: E402
 
-SESSION_FILE = bot.LMS_SESSION_FILE
-COURSES_URL = "https://lms.mtuci.ru/lms/my/courses.php"
-LOGIN_URL = "https://lms.mtuci.ru/login/index.php"
-# names of the anti-bot shield cookies — clearance is bound to IP + TLS fingerprint
-SHIELD_COOKIE_RE = re.compile(r"^(__cap|__hash|__lhash|__ddg|__cf)")
+LMS = "https://lms.mtuci.ru"
+LOGIN_URL = f"{LMS}/login/index.php"
+DASH_URL = f"{LMS}/lms/my/"
+COURSELIST_METHOD = "core_course_get_enrolled_courses_by_timeline_classification"
+
+PROXY = os.environ.get("LMS_PROXY", "socks5h://127.0.0.1:1081")
+UA = os.environ.get(
+    "LMS_UA",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+
 KTALK_RE = re.compile(
     r"https://[a-z0-9.-]*ktalk\.ru/[A-Za-z0-9._-]+"
     r"|https://[a-z0-9.-]*zoom\.[a-z]+/j/[0-9]+(?:\?pwd=[A-Za-z0-9._-]+)?"
-    r"|https://[a-z0-9.-]*bbb[a-z0-9.-]*/[A-Za-z0-9/_?=&.-]+"
-)
+    r"|https://[a-z0-9.-]*bbb[a-z0-9.-]*/[A-Za-z0-9/_?=&.-]+", re.I)
+MOD_RE = re.compile(
+    r"https://lms\.mtuci\.ru/(?:lms/)?mod/(?:konturtalk|bigbluebuttonbn|zoom|url)"
+    r"/view\.php\?id=\d+", re.I)
+
+
+class LMSError(Exception):
+    pass
 
 
 def notify_owner(cfg, text):
@@ -41,198 +52,139 @@ def notify_owner(cfg, text):
             print(f"notify_owner failed: {e}", flush=True)
 
 
-def _persist_jar(session, cookies):
-    """Save the full cookie jar back (keeps shield cookies like __lhash_ rolling
-    forward, plus the fresh MoodleSession after an SSO re-login)."""
-    keep = [{"name": c["name"], "value": c["value"],
-             "domain": c["domain"], "path": c.get("path", "/")}
-            for c in cookies
-            if c["domain"].endswith("mtuci.ru")
-            and (c["name"] == "MoodleSession" or SHIELD_COOKIE_RE.match(c["name"]))]
-    if keep:
-        session["cookies"] = keep
-        session["updated"] = bot.msk_now().isoformat()
-        bot.save_json(SESSION_FILE, session)
+def _submit_autoform(sess, text):
+    """POST the JS-less auto-submit form — Keycloak's OIDC ``form_post`` response
+    that carries the auth code back to lms.mtuci.ru/auth/oidc/."""
+    fm = re.search(r"<form[^>]*action=\"([^\"]+)\"[^>]*>(.*?)</form>", text, re.S | re.I)
+    if not fm:
+        raise LMSError("Keycloak did not return a form_post response (login rejected?)")
+    action = html.unescape(fm.group(1))
+    fields = {}
+    for inp in re.findall(r"<input[^>]+>", fm.group(2), re.I):
+        n = re.search(r"name=\"([^\"]+)\"", inp, re.I)
+        v = re.search(r"value=\"([^\"]*)\"", inp, re.I)
+        if n and n.group(1).lower() != "continue":
+            fields[n.group(1)] = html.unescape(v.group(1)) if v else ""
+    return sess.post(action, data=fields, timeout=30)
 
 
-async def _is_captcha(page):
-    return "captcha" in (await page.title()).lower()
-
-
-async def _sso_login(page):
-    """The MoodleSession idle-timed out but shield clearance still holds: we land
-    on the shared MTUCI Keycloak form. Log back in with the MTUCI credentials
-    (same realm/creds as the lk.mtuci.ru schedule scraper)."""
+def login():
     email = os.environ.get("MTUCI_EMAIL")
     password = os.environ.get("MTUCI_PASSWORD")
     if not email or not password:
-        print("no MTUCI_EMAIL/PASSWORD for SSO re-login", flush=True)
-        return False
+        raise LMSError("MTUCI_EMAIL / MTUCI_PASSWORD not set")
+
+    sess = requests.Session()
+    sess.proxies = {"http": PROXY, "https": PROXY}
+    sess.headers["User-Agent"] = UA
+
     try:
-        await page.wait_for_selector("#username", state="visible", timeout=15000)
-        await page.fill("#username", email)
-        await page.fill("#password", password)
-        await page.click("#login-submit-button, #kc-login, button[type=submit]",
-                         timeout=10000)
-        await page.wait_for_load_state("networkidle", timeout=45000)
-    except Exception as e:
-        print(f"SSO re-login failed: {e}", flush=True)
-        return False
-    ok = "lms.mtuci.ru" in page.url and "/login/" not in page.url
-    print(f"SSO re-login {'ok' if ok else 'did not stick'} -> {page.url}", flush=True)
-    return ok
+        r = sess.get(LOGIN_URL, timeout=30)
+    except requests.RequestException as e:
+        raise LMSError(f"proxy/network unreachable ({e.__class__.__name__}) — "
+                       f"check LMS_PROXY / lms-proxy.service")
+    if "<title>Captcha</title>" in r.text:
+        raise LMSError("CAPTCHA")
+
+    m = re.search(r"<form[^>]+id=\"kc-form-login\"[^>]+action=\"([^\"]+)\"", r.text)
+    if not m:
+        raise LMSError(f"no Keycloak login form at {r.url}")
+    action = html.unescape(m.group(1))
+    r2 = sess.post(action,
+                   data={"username": email, "password": password,
+                         "credentialId": "", "login": "Войти"},
+                   headers={"Referer": r.url}, timeout=30)
+    if "Form_Post" not in r2.text and "auth/oidc" not in r2.text:
+        raise LMSError("SSO login rejected — check MTUCI_PASSWORD")
+    _submit_autoform(sess, r2.text)
+    if "MoodleSession" not in sess.cookies:
+        raise LMSError("no MoodleSession cookie after SSO")
+    return sess
 
 
-async def scrape(session):
-    found = {}  # course_name -> conference url
-    async with async_playwright() as pw:
-        br = await pw.firefox.launch(headless=True)
-        ua = session.get("ua") or os.environ.get(
-            "LMS_UA", "Mozilla/5.0 (Android 12; Mobile; rv:155.0) Gecko/155.0 Firefox/155.0")
-        ctx = await br.new_context(user_agent=ua,
-                                   viewport={"width": 1280, "height": 2200})
-        await ctx.add_cookies(session["cookies"])
-        page = await ctx.new_page()
-        await page.goto(COURSES_URL, wait_until="networkidle", timeout=45000)
-
-        if await _is_captcha(page):
-            await br.close()
-            return None  # shield clearance lost (IP changed / fingerprint) — needs a human
-
-        if "/login/" in page.url or "bvzauth" in page.url or "lk.mtuci.ru" in page.url:
-            if not await _sso_login(page):
-                await br.close()
-                return None
-            await page.goto(COURSES_URL, wait_until="networkidle", timeout=45000)
-            if await _is_captcha(page) or "/login/" in page.url:
-                await br.close()
-                return None
-
-        _persist_jar(session, await ctx.cookies())
-
-        courses = await page.eval_on_selector_all(
-            "a[href*='/course/view.php?id=']",
-            """els => {
-                const m = {};
-                for (const e of els) {
-                    const t = (e.getAttribute('aria-label') || e.textContent || '').trim();
-                    if (t && t !== 'Название курса' && !t.includes('избранным'))
-                        m[e.href.split('#')[0]] = t;
-                }
-                return Object.entries(m);
-            }""")
-
-        for href, name in courses:
-            try:
-                await page.goto(href, wait_until="networkidle", timeout=45000)
-                act = await page.eval_on_selector_all(
-                    "a[href*='/mod/konturtalk/'], a[href*='/mod/bigbluebuttonbn/'], "
-                    "a[href*='/mod/zoom/'], a[href*='/mod/url/']",
-                    "els => [...new Set(els.map(e => e.href))]")
-                if not act:
-                    continue
-                await page.goto(act[0], wait_until="networkidle", timeout=45000)
-                html = await page.content()
-                m = KTALK_RE.search(html)
-                if m:
-                    found[name] = m.group(0)
-                else:
-                    # a /mod/url/ activity redirects straight to the meeting
-                    if "/mod/url/" in act[0] and KTALK_RE.search(page.url):
-                        found[name] = page.url
-            except Exception as e:
-                print(f"course '{name}' failed: {e}", flush=True)
-        _persist_jar(session, await ctx.cookies())
-        await br.close()
-    return found
+def list_courses(sess):
+    r = sess.get(DASH_URL, timeout=30)
+    mk = re.search(r"\"sesskey\":\"(\w+)\"", r.text)
+    if not mk:
+        raise LMSError("no sesskey on dashboard (not logged in?)")
+    payload = [{"index": 0, "methodname": COURSELIST_METHOD,
+                "args": {"offset": 0, "limit": 0,
+                         "classification": "all", "sort": "fullname"}}]
+    w = sess.post(f"{LMS}/lib/ajax/service.php?sesskey={mk.group(1)}"
+                  f"&info={COURSELIST_METHOD}", json=payload, timeout=40)
+    data = w.json()[0]
+    if data.get("error"):
+        raise LMSError(f"course list error: {data.get('exception', data)}")
+    return [(c["fullname"], c["viewurl"]) for c in data["data"]["courses"]]
 
 
-async def keepalive(session):
-    """Cheap warm-up: hit an authenticated page, re-login via SSO if the Moodle
-    session idled out, roll the cookie jar forward. Returns True while the shield
-    still clears this host, False when a human needs to re-solve the CAPTCHA."""
-    async with async_playwright() as pw:
-        br = await pw.firefox.launch(headless=True)
-        ua = session.get("ua") or os.environ.get(
-            "LMS_UA", "Mozilla/5.0 (Android 12; Mobile; rv:155.0) Gecko/155.0 Firefox/155.0")
-        ctx = await br.new_context(user_agent=ua, viewport={"width": 1280, "height": 900})
-        await ctx.add_cookies(session["cookies"])
-        page = await ctx.new_page()
+def course_conf_link(sess, viewurl):
+    r = sess.get(viewurl, timeout=30)
+    for mod_url in dict.fromkeys(m.group(0) for m in MOD_RE.finditer(r.text)):
+        mr = sess.get(mod_url, timeout=30)
+        k = KTALK_RE.search(mr.text)
+        if k:
+            return k.group(0)
+        if "/mod/url/" in mod_url and KTALK_RE.search(mr.url):
+            return mr.url
+    return None
+
+
+def scrape():
+    sess = login()
+    found = {}  # course_fullname -> conference url
+    for name, viewurl in list_courses(sess):
         try:
-            await page.goto("https://lms.mtuci.ru/lms/my/",
-                            wait_until="networkidle", timeout=45000)
-            if await _is_captcha(page):
-                return False
-            if "/login/" in page.url or "bvzauth" in page.url or "lk.mtuci.ru" in page.url:
-                if not await _sso_login(page):
-                    return False
-            _persist_jar(session, await ctx.cookies())
-            return True
-        finally:
-            await br.close()
-
-
-CAPTCHA_MSG = (
-    "⚠️ LMS не пускает: капча не пройдена для IP этого сервера "
-    "(обычно после перезагрузки сервера — сменился IP).\n\n"
-    "Нужно один раз пройти слайдер вручную:\n"
-    "1. Подключи телефон к VPN этого сервера.\n"
-    "2. Открой lms.mtuci.ru в своём браузере, пройди капчу, залогинься.\n"
-    "3. /links → 🔄 Обновить cookie LMS → вставь cookie-файл.\n\n"
-    "Пароль от МТУСИ бот вводит сам — обновлять cookie нужно только при смене IP."
-)
-
-
-def _captcha_notify_once(cfg):
-    """DM the owner the CAPTCHA instructions at most once per outage."""
-    state = bot.load_json(cfg["state_file"], {})
-    if not state.get("lms_captcha_notified"):
-        notify_owner(cfg, CAPTCHA_MSG)
-        state["lms_captcha_notified"] = True
-        bot.save_json(cfg["state_file"], state)
-
-
-def _clear_captcha_flag(cfg):
-    state = bot.load_json(cfg["state_file"], {})
-    if state.get("lms_captcha_notified"):
-        state["lms_captcha_notified"] = None
-        bot.save_json(cfg["state_file"], state)
+            url = course_conf_link(sess, viewurl)
+            if url:
+                found[name] = url
+        except Exception as e:
+            print(f"course '{name}' failed: {e}", flush=True)
+    return found
 
 
 def main():
     cfg = bot.load_config()
-    session = bot.load_json(SESSION_FILE, None)
-    if not session:
-        print("no lms_session.json", flush=True)
-        if "--keepalive" not in sys.argv:
-            _captcha_notify_once(cfg)
+    try:
+        result = scrape()
+    except LMSError as e:
+        print(f"LMS scrape failed: {e}", flush=True)
+        state = bot.load_json(cfg["state_file"], {})
+        if not state.get("lms_fail_notified"):
+            if str(e) == "CAPTCHA":
+                msg = ("⚠️ LMS отдаёт капчу — прокси до РФ (LMS_PROXY) не работает.\n"
+                       "Проверь на сервере: <code>systemctl status lms-proxy</code>")
+            else:
+                msg = f"⚠️ Не смог зайти в LMS: {e}"
+            notify_owner(cfg, msg)
+            state["lms_fail_notified"] = True
+            bot.save_json(cfg["state_file"], state)
         return
 
-    if "--keepalive" in sys.argv:
-        ok = asyncio.run(keepalive(session))
-        print(f"keepalive: {'ok' if ok else 'CAPTCHA lost'}", flush=True)
-        if ok:
-            _clear_captcha_flag(cfg)
-        else:
-            _captcha_notify_once(cfg)
-        return
+    state = bot.load_json(cfg["state_file"], {})
+    if state.get("lms_fail_notified"):
+        state["lms_fail_notified"] = None
+        bot.save_json(cfg["state_file"], state)
 
-    result = asyncio.run(scrape(session))
-    if result is None:
-        print("LMS session expired", flush=True)
-        _captcha_notify_once(cfg)
-        return
-    _clear_captcha_flag(cfg)
-
+    group = os.environ.get("GROUP_LABEL", "")
     subjects = list(bot.load_topic_subjects(cfg))
     links = bot.load_json(cfg["conf_links_file"], {})
-    updated = []
+
+    # a subject can have several LMS courses (per-stream copies) with different
+    # links — keep the one whose raw course name names our group.
+    picked = {}  # subject -> (course_name, url)
     for course_name, url in result.items():
         clean = re.sub(r"\s*\([^)]*\)", "", course_name).strip()
         subj = bot.match_subject(clean, subjects)
         if not subj:
             print(f"no topic match for course '{course_name}'", flush=True)
             continue
+        cur = picked.get(subj)
+        if cur is None or (group and group in course_name and group not in cur[0]):
+            picked[subj] = (course_name, url)
+
+    updated = []
+    for subj, (course_name, url) in picked.items():
         if links.get(subj, {}).get("url") == url:
             continue
         msg = bot.set_conf_link(cfg, subj, url)
@@ -243,11 +195,12 @@ def main():
         updated.append(f"{subj}: {url}")
         print(msg, flush=True)
 
-    print(f"done, {len(result)} conf links found, {len(updated)} updated", flush=True)
+    print(f"done, {len(picked)} conf links found, {len(updated)} updated", flush=True)
     if updated:
         notify_owner(cfg, "🎥 Автопарсер LMS обновил ссылки:\n" + "\n".join(updated))
     elif "--report" in sys.argv:
-        notify_owner(cfg, f"🎥 Прогнал парсер LMS: нашёл {len(result)} ссылок, изменений нет.")
+        notify_owner(cfg, f"🎥 Прогнал парсер LMS: нашёл {len(picked)} ссылок, "
+                          f"изменений нет.")
 
 
 if __name__ == "__main__":
