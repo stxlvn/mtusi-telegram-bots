@@ -5,7 +5,7 @@ and publish them into the matching Telegram subject topics.
 lms.mtuci.ru sits behind a slider-CAPTCHA shield that binds clearance to
 IP + browser fingerprint, so it can only be reached with a real Firefox engine
 using cookies exported from a browser that solved the CAPTCHA while routed
-through this server's IP (dim-wiluite VPN). Session is refreshed by the owner via
+through this server's own IP (its VPN endpoint). Refreshed by the owner via
 the bot's /lms command. On expiry the owner is DM'd.
 """
 import asyncio

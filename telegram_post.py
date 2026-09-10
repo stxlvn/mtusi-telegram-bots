@@ -153,7 +153,8 @@ def escape_html(text):
 
 def build_daily_digest_rich(day_events, target_date):
     weekday = WEEKDAYS[target_date.weekday()]
-    header = f"📅 Расписание на {target_date.strftime('%d.%m.%Y')} ({weekday}) — {GROUP_LABEL}"
+    label = f" — {GROUP_LABEL}" if GROUP_LABEL else ""
+    header = f"📅 Расписание на {target_date.strftime('%d.%m.%Y')} ({weekday}){label}"
 
     rows_html = "".join(
         f"<tr><td>{escape_html(format_time(e.start_time))}-{escape_html(format_time(e.end_time))}</td>"
