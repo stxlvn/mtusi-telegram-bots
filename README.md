@@ -68,19 +68,19 @@ SOCKS-прокси с российским выходом** (`LMS_PROXY` в `.en
 по тому же Keycloak МТУСИ (`MTUCI_EMAIL` / `MTUCI_PASSWORD`, что и парсер расписания)
 и читает список курсов. Ни браузера, ни cookie-файлов.
 
-Как поднять российский выход:
+Как поднять российский выход — годится любой SSH-доступный хост с российским IP
+(VPS, домашний роутер с SSH и белым IP и т.п.):
 
-1. Возьми любой дешёвый VPS у российского провайдера (нужен свой выделенный IP).
-2. Прокинь с него SOCKS5 на машину бота, например через `autossh`:
+1. Прокинь с него SOCKS5 на машину бота через `autossh`:
    ```ini
    # /etc/systemd/system/lms-proxy.service
    [Service]
    Environment=AUTOSSH_GATETIME=0
    ExecStart=/usr/bin/autossh -M 0 -N -D 127.0.0.1:1081 \
-     -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes root@<RU-VPS-IP>
+     -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes root@<RU-хост>
    Restart=always
    ```
-3. `LMS_PROXY=socks5h://127.0.0.1:1081` в `.env`.
+2. `LMS_PROXY=socks5h://127.0.0.1:1081` в `.env`.
 
 Если прокси отвалится, LMS вернёт капчу — бот один раз напишет в личку
 (`systemctl status lms-proxy`). Ссылки при этом остаются те, что уже нашли; можно
