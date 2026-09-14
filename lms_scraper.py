@@ -4,18 +4,24 @@ and publish them into the matching Telegram subject topics.
 
 lms.mtuci.ru sits behind an anti-bot shield that hits non-Russian IPs with a
 slider CAPTCHA. This scraper routes through a Russian SOCKS proxy (``LMS_PROXY``);
-from a RU IP there is no CAPTCHA, so a plain HTTP session logs in through the
-shared MTUCI Keycloak SSO (``MTUCI_EMAIL`` / ``MTUCI_PASSWORD``) and reads the
-course list via Moodle's AJAX endpoint. No browser, no cookie file to maintain.
+from a RU IP there is no CAPTCHA. The login step still needs a real (JS-capable)
+browser though — lk.mtuci.ru's Keycloak entry sometimes serves a transient
+JS-redirect interstitial (a blank "noindex" spinner page) before the actual
+login form, which a plain HTTP client can never get past. So: log in once via
+a minimal Playwright sequence through the proxy, then hand the resulting
+cookies to a plain ``requests`` session for the rest — course listing via
+Moodle's AJAX endpoint, course/module pages.
 
 bot.py's main loop spawns this once a day; also runnable standalone.
 """
-import html
+import asyncio
 import os
 import re
 import sys
+import time
 
 import requests
+from playwright.async_api import async_playwright
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -52,54 +58,88 @@ def notify_owner(cfg, text):
             print(f"notify_owner failed: {e}", flush=True)
 
 
-def _submit_autoform(sess, text):
-    """POST the JS-less auto-submit form — Keycloak's OIDC ``form_post`` response
-    that carries the auth code back to lms.mtuci.ru/auth/oidc/."""
-    fm = re.search(r"<form[^>]*action=\"([^\"]+)\"[^>]*>(.*?)</form>", text, re.S | re.I)
-    if not fm:
-        raise LMSError("Keycloak did not return a form_post response (login rejected?)")
-    action = html.unescape(fm.group(1))
-    fields = {}
-    for inp in re.findall(r"<input[^>]+>", fm.group(2), re.I):
-        n = re.search(r"name=\"([^\"]+)\"", inp, re.I)
-        v = re.search(r"value=\"([^\"]*)\"", inp, re.I)
-        if n and n.group(1).lower() != "continue":
-            fields[n.group(1)] = html.unescape(v.group(1)) if v else ""
-    return sess.post(action, data=fields, timeout=30)
-
-
-def login():
+async def _browser_login_cookies():
+    """Log in via a real browser routed through the RU proxy and hand back its
+    cookie jar. Deliberately NOT using the shared MTUCIAuthenticator here: the
+    LMS SSO flow bounces through several more redirects than lk.mtuci.ru's own
+    login (Keycloak's JS-redirect interstitial, then its OIDC form_post
+    auto-submit hop back to lms.mtuci.ru/auth/oidc/), and the authenticator's
+    DOM-querying validation step raced one of those navigations and blew up
+    with "Execution context was destroyed". So: only navigation-safe waits
+    here (wait_for_selector / wait_for_url), no querying mid-redirect — the
+    real verdict is just whether MoodleSession shows up in the cookie jar."""
     email = os.environ.get("MTUCI_EMAIL")
     password = os.environ.get("MTUCI_PASSWORD")
     if not email or not password:
         raise LMSError("MTUCI_EMAIL / MTUCI_PASSWORD not set")
 
-    sess = requests.Session()
-    sess.proxies = {"http": PROXY, "https": PROXY}
-    sess.headers["User-Agent"] = UA
+    proxy_server = PROXY.replace("socks5h://", "socks5://")
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True, proxy={"server": proxy_server},
+            args=["--no-sandbox", "--disable-setuid-sandbox"])
+        try:
+            ctx = await browser.new_context(user_agent=UA)
+            page = await ctx.new_page()
+            try:
+                await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                raise LMSError(f"proxy/network unreachable ({e.__class__.__name__}) — "
+                               f"check LMS_PROXY / lms-proxy.service") from e
+            if "captcha" in (await page.title()).lower():
+                raise LMSError("CAPTCHA")
 
-    try:
-        r = sess.get(LOGIN_URL, timeout=30)
-    except requests.RequestException as e:
-        raise LMSError(f"proxy/network unreachable ({e.__class__.__name__}) — "
-                       f"check LMS_PROXY / lms-proxy.service")
-    if "<title>Captcha</title>" in r.text:
-        raise LMSError("CAPTCHA")
+            try:
+                await page.wait_for_selector("#username", state="visible", timeout=20000)
+            except Exception as e:
+                raise LMSError(f"no login form appeared ({e.__class__.__name__})") from e
 
-    m = re.search(r"<form[^>]+id=\"kc-form-login\"[^>]+action=\"([^\"]+)\"", r.text)
-    if not m:
-        raise LMSError(f"no Keycloak login form at {r.url}")
-    action = html.unescape(m.group(1))
-    r2 = sess.post(action,
-                   data={"username": email, "password": password,
-                         "credentialId": "", "login": "Войти"},
-                   headers={"Referer": r.url}, timeout=30)
-    if "Form_Post" not in r2.text and "auth/oidc" not in r2.text:
-        raise LMSError("SSO login rejected — check MTUCI_PASSWORD")
-    _submit_autoform(sess, r2.text)
-    if "MoodleSession" not in sess.cookies:
-        raise LMSError("no MoodleSession cookie after SSO")
-    return sess
+            await page.fill("#username", email)
+            await page.fill("#password", password)
+            try:
+                async with page.expect_navigation(wait_until="domcontentloaded", timeout=30000):
+                    await page.click("#login-submit-button, #kc-login, button[type=submit]")
+            except Exception:
+                pass  # not every hop counts as a tracked "navigation" — fine either way
+
+            # Keycloak's OIDC form_post interstitial auto-submits itself via an
+            # inline <script>; just wait to land back on lms.mtuci.ru, don't poke the DOM
+            try:
+                await page.wait_for_url(lambda u: "lms.mtuci.ru" in u and "/login/" not in u,
+                                        timeout=20000)
+            except Exception:
+                pass  # cookie check below is the real verdict either way
+
+            return await ctx.cookies()
+        finally:
+            await browser.close()
+
+
+def login(attempts=3, delay_sec=10):
+    """The interstitial before the Keycloak form is flaky — sometimes gone in
+    2s, sometimes never resolves within a generous timeout. Observed to
+    usually succeed on a fresh attempt, so just retry the whole login."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            cookies = asyncio.run(_browser_login_cookies())
+            sess = requests.Session()
+            sess.proxies = {"http": PROXY, "https": PROXY}
+            sess.headers["User-Agent"] = UA
+            for c in cookies:
+                sess.cookies.set(c["name"], c["value"], domain=c["domain"],
+                                 path=c.get("path", "/"))
+            if "MoodleSession" not in sess.cookies:
+                raise LMSError("no MoodleSession cookie after SSO")
+            return sess
+        except LMSError as e:
+            if str(e) == "CAPTCHA":
+                raise  # a real shield block — retrying won't help
+            last_error = e
+            print(f"login attempt {attempt}/{attempts} failed: {e}", flush=True)
+            if attempt < attempts:
+                time.sleep(delay_sec)
+    raise last_error
 
 
 def list_courses(sess):
