@@ -49,7 +49,9 @@ WEEKDAYS = ["понедельник", "вторник", "среда", "четв�
 
 
 def msk_now():
-    return datetime.now(UTC) + MSK_OFFSET
+    # naive, MSK wall-clock — see bot.py's msk_now() for why (must stay
+    # comparable with the scraper's naive lesson start/end datetimes)
+    return datetime.now(UTC).replace(tzinfo=None) + MSK_OFFSET
 
 
 async def fetch_events():

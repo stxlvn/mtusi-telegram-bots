@@ -20,6 +20,8 @@ from telegram_post import ensure_topic  # noqa: E402
 from telegram_post import fetch_events_retrying  # noqa: E402
 from telegram_post import tg_api as schedule_tg_api  # noqa: E402
 
+import lk_attendance  # noqa: E402
+
 LMS_SCRAPER = os.path.join(SCRIPT_DIR, "lms_scraper.py")
 LMS_LOG = os.path.join(DATA_DIR, "lms_scraper.log")
 SCHEDULE_SCRIPT = os.path.join(SCRIPT_DIR, "telegram_post.py")
@@ -79,7 +81,12 @@ def save_json(path, data):
 
 
 def msk_now():
-    return datetime.now(UTC) + timedelta(hours=3)
+    # naive, MSK wall-clock — matches the scraper's naive lesson start/end
+    # datetimes (scraped straight off the site's local-time display), so the
+    # two are directly comparable. A tz-aware value here made every lesson
+    # open/close comparison raise "can't compare offset-naive and
+    # offset-aware datetimes" the moment today's lessons were non-empty.
+    return datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=3)
 
 
 def normalize_fio(s):
@@ -259,6 +266,26 @@ def close_lesson(cfg, lesson, roster):
     )
     lesson["closed"] = True
     print(f"closed checkin for '{lesson['subject']}': {len(present_fio)}/{len(roster)}", flush=True)
+
+    try:
+        report = asyncio.run(lk_attendance.submit(
+            lesson["subject"], lesson["start"], lesson["end"], list(present)))
+    except Exception as e:
+        report = {"ok": False, "error": str(e), "marked": [], "not_in_sheet": []}
+
+    if report["ok"]:
+        owner_msg = (f"✅ ЛК МТУСИ: отметил {len(report['marked'])}/{len(present)} "
+                     f"по «{lesson['subject']}»")
+        if report["not_in_sheet"]:
+            owner_msg += f"\n⚠️ не нашёл в ведомости: {len(report['not_in_sheet'])} uid"
+    else:
+        owner_msg = f"⚠️ Не смог отметить посещаемость в ЛК для «{lesson['subject']}»: {report['error']}"
+    print(owner_msg.replace("\n", " | "), flush=True)
+    if cfg.get("owner_telegram_id"):
+        try:
+            tg_api(cfg, "sendMessage", chat_id=cfg["owner_telegram_id"], text=owner_msg)
+        except Exception:
+            pass
 
 
 def handle_lesson_checkin(cfg, cq, uid, roster, student_map, state):
@@ -730,15 +757,6 @@ def main():
     participants = load_participants(cfg)
     offset = load_offset(cfg)
 
-    # a mid-day restart must not replay today's daily jobs: if we're already past
-    # a job's trigger time and it has never run, mark it done for today.
-    _now = msk_now()
-    _today = _now.date().isoformat()
-    for key, at in (("last_lms_scrape", LMS_SCRAPE_AT), ("last_digest", SCHEDULE_POST_AT)):
-        if key not in state and (_now.hour, _now.minute) >= at:
-            state[key] = _today
-    save_json(cfg["state_file"], state)
-
     print(f"bot started, roster={len(roster)} students, participants={len(participants)}", flush=True)
 
     while True:
@@ -761,7 +779,7 @@ def main():
             today = msk_now().date().isoformat()
             hm = (now.hour, now.minute)
 
-            if state.get("last_lms_scrape") != today and hm >= LMS_SCRAPE_AT:
+            if state.get("last_lms_scrape") != today and hm >= LMS_SCRAPE_AT and now.hour < 12:
                 state["last_lms_scrape"] = today
                 save_json(cfg["state_file"], state)
                 print("spawning daily LMS scrape", flush=True)
