@@ -313,18 +313,20 @@ def handle_lesson_checkin(cfg, cq, uid, roster, student_map, state):
 
     if uid not in lesson["present_uids"]:
         lesson["present_uids"].append(uid)
-        save_json(cfg["state_file"], state)
-        chat_id = msg.get("chat", {}).get("id")
-        message_id = msg.get("message_id")
-        if chat_id and message_id:
-            try:
-                tg_api(cfg, "editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
-                       reply_markup=json.dumps(build_lesson_checkin_keyboard(roster, lesson["present_uids"])))
-            except Exception as e:
-                print(f"editMessageReplyMarkup failed: {e}", flush=True)
         text = f"Отмечено, {registered['fio']} ✅"
     else:
-        text = f"Ты уже отмечен(а) как {registered['fio']} ✅"
+        lesson["present_uids"].remove(uid)
+        text = f"Отметка снята, {registered['fio']}"
+
+    save_json(cfg["state_file"], state)
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+    if chat_id and message_id:
+        try:
+            tg_api(cfg, "editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
+                   reply_markup=json.dumps(build_lesson_checkin_keyboard(roster, lesson["present_uids"])))
+        except Exception as e:
+            print(f"editMessageReplyMarkup failed: {e}", flush=True)
 
     try:
         tg_api(cfg, "answerCallbackQuery", callback_query_id=cq["id"], text=text)
