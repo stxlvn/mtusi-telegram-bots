@@ -268,6 +268,12 @@ def close_lesson(cfg, lesson, roster):
         text="\n".join(lines),
         parse_mode="HTML",
     )
+    if lesson.get("checkin_message_id"):
+        try:
+            tg_api(cfg, "deleteMessage", chat_id=cfg["chat_id"],
+                   message_id=lesson["checkin_message_id"])
+        except Exception as e:
+            print(f"delete old checkin message failed: {e}", flush=True)
     lesson["closed"] = True
     print(f"closed checkin for '{lesson['subject']}': {len(present_fio)}/{len(roster)}", flush=True)
 
