@@ -24,12 +24,15 @@ import lk_attendance  # noqa: E402
 
 LMS_SCRAPER = os.path.join(SCRIPT_DIR, "lms_scraper.py")
 LMS_LOG = os.path.join(DATA_DIR, "lms_scraper.log")
+LMS_MATERIALS = os.path.join(SCRIPT_DIR, "lms_materials.py")
+LMS_MATERIALS_LOG = os.path.join(DATA_DIR, "lms_materials.log")
 SCHEDULE_SCRIPT = os.path.join(SCRIPT_DIR, "telegram_post.py")
 SCHEDULE_LOG = os.path.join(DATA_DIR, "schedule.log")
 VENV_PY = sys.executable
 
 # daily jobs folded into the main loop (no cron); MSK HH:MM triggers
 LMS_SCRAPE_AT = (7, 35)
+LMS_MATERIALS_AT = (7, 45)
 SCHEDULE_POST_AT = (8, 0)
 
 
@@ -62,6 +65,7 @@ def load_config():
         "offset_file": os.path.join(DATA_DIR, "offset.txt"),
         "conf_links_file": os.path.join(DATA_DIR, "conf_links.json"),
         "topics_file": os.path.join(DATA_DIR, "topics.json"),
+        "materials_file": os.path.join(DATA_DIR, "lms_materials.json"),
         "participants_file": os.path.join(SCRIPT_DIR, "userbot", "participants.json"),
     }
 
@@ -786,6 +790,12 @@ def main():
                 save_json(cfg["state_file"], state)
                 print("spawning daily LMS scrape", flush=True)
                 spawn(LMS_SCRAPER, log=LMS_LOG)
+
+            if state.get("last_lms_materials") != today and hm >= LMS_MATERIALS_AT and now.hour < 12:
+                state["last_lms_materials"] = today
+                save_json(cfg["state_file"], state)
+                print("spawning daily LMS materials post", flush=True)
+                spawn(LMS_MATERIALS, log=LMS_MATERIALS_LOG)
 
             if state.get("last_digest") != today and hm >= SCHEDULE_POST_AT and now.hour < 12:
                 state["last_digest"] = today

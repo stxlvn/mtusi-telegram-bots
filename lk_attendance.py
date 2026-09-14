@@ -20,6 +20,7 @@ Keycloak auth the schedule scraper uses.
 Not a standalone job — bot.py's close_lesson() calls submit() right when a
 lesson's Telegram check-in window closes.
 """
+import asyncio
 import os
 import sys
 from datetime import datetime
@@ -105,10 +106,55 @@ async def _mark(page, reg, row_num, student_ref):
     await _call(page, "update_ScoreToLineAttendance", payload)
 
 
-async def submit(subject, start_iso, end_iso, present_uids):
+async def _submit_once(subject, start_iso, end_iso, present_uids):
+    """One attempt: log in, find the sheet, mark present_uids. Raises on any
+    failure (auth included) — submit() below is what retries."""
+    report = {"ok": False, "marked": [], "not_in_sheet": [], "error": None}
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+        try:
+            ctx = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            )
+            page = await ctx.new_page()
+            auth_cfg = AuthConfig(email=MTUCI_EMAIL, password=MTUCI_PASSWORD,
+                                  login_url=MTUCI_LOGIN_URL)
+            # authenticate() returns None on success and *raises* on failure —
+            # it does not return a truthy/falsy verdict, so just let it raise
+            await MTUCIAuthenticator(auth_cfg).authenticate(page)
+
+            reg = await _find_sheet(page, subject, start_iso, end_iso)
+            if not reg:
+                raise AttendanceError(f"no open ведомость for '{subject}' "
+                                      f"{_time_label(start_iso, end_iso)}")
+
+            rows = await _sheet_rows(page, reg)
+            by_uid = {r["Обучающийся"]["uid"]: r for r in rows}
+
+            for uid in present_uids:
+                row = by_uid.get(uid)
+                if row is None:
+                    report["not_in_sheet"].append(uid)
+                    continue
+                await _mark(page, reg, row["НомерСтроки"], row["Обучающийся"])
+                report["marked"].append(row["Обучающийся"]["name"])
+            report["ok"] = True
+            return report
+        finally:
+            await browser.close()
+
+
+async def submit(subject, start_iso, end_iso, present_uids, attempts=3, delay_sec=10):
     """Mark present_uids (== roster.json uid == ФизическиеЛица uid) present in
     the matching official sheet. Returns a report dict, never raises past
-    this point — caller decides how to surface failures."""
+    this point — caller decides how to surface failures.
+
+    lk.mtuci.ru's own Keycloak validation is occasionally flaky the same way
+    lms.mtuci.ru's login is (see lms_scraper.py) — confirmed NOT an account
+    lockout (a plain login right after a failure succeeds fine), so retry the
+    whole browser session a few times before giving up."""
     report = {"ok": False, "marked": [], "not_in_sheet": [], "error": None}
     if not MTUCI_EMAIL or not MTUCI_PASSWORD:
         report["error"] = "MTUCI_EMAIL/MTUCI_PASSWORD not set"
@@ -116,42 +162,14 @@ async def submit(subject, start_iso, end_iso, present_uids):
     if not present_uids:
         report["ok"] = True
         return report
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-            try:
-                ctx = await browser.new_context(
-                    viewport={"width": 1920, "height": 1080},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                )
-                page = await ctx.new_page()
-                cfg = AuthConfig(email=MTUCI_EMAIL, password=MTUCI_PASSWORD,
-                                 login_url=MTUCI_LOGIN_URL)
-                ok = await MTUCIAuthenticator(cfg).authenticate(page)
-                if not ok:
-                    report["error"] = "authentication failed"
-                    return report
-
-                reg = await _find_sheet(page, subject, start_iso, end_iso)
-                if not reg:
-                    report["error"] = (f"no open ведомость for '{subject}' "
-                                       f"{_time_label(start_iso, end_iso)}")
-                    return report
-
-                rows = await _sheet_rows(page, reg)
-                by_uid = {r["Обучающийся"]["uid"]: r for r in rows}
-
-                for uid in present_uids:
-                    row = by_uid.get(uid)
-                    if row is None:
-                        report["not_in_sheet"].append(uid)
-                        continue
-                    await _mark(page, reg, row["НомерСтроки"], row["Обучающийся"])
-                    report["marked"].append(row["Обучающийся"]["name"])
-                report["ok"] = True
-            finally:
-                await browser.close()
-    except Exception as e:
-        report["error"] = str(e)
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await _submit_once(subject, start_iso, end_iso, present_uids)
+        except Exception as e:
+            last_error = e
+            print(f"lk_attendance attempt {attempt}/{attempts} failed: {e}", flush=True)
+            if attempt < attempts:
+                await asyncio.sleep(delay_sec)
+    report["error"] = str(last_error)
     return report

@@ -147,9 +147,13 @@ def list_courses(sess):
     mk = re.search(r"\"sesskey\":\"(\w+)\"", r.text)
     if not mk:
         raise LMSError("no sesskey on dashboard (not logged in?)")
+    # "inprogress" (not "all") — Moodle itself then excludes past-semester
+    # leftover course instances (e.g. a prior term's duplicate "Высшая
+    # математика" that's still enrolled but long over), instead of relying
+    # only on the GROUP_LABEL name-preference below to sort it out.
     payload = [{"index": 0, "methodname": COURSELIST_METHOD,
                 "args": {"offset": 0, "limit": 0,
-                         "classification": "all", "sort": "fullname"}}]
+                         "classification": "inprogress", "sort": "fullname"}}]
     w = sess.post(f"{LMS}/lib/ajax/service.php?sesskey={mk.group(1)}"
                   f"&info={COURSELIST_METHOD}", json=payload, timeout=40)
     data = w.json()[0]
