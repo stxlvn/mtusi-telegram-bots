@@ -187,7 +187,8 @@ FETCH_COOLDOWN_SEC = 1800  # after a failed fetch, don't hammer lk.mtuci.ru agai
 
 def refresh_today_lessons(cfg, state):
     today = msk_now().date().isoformat()
-    if state.get("date") == today and state.get("lessons") is not None:
+    force = state.pop("force_refresh", False)
+    if not force and state.get("date") == today and state.get("lessons") is not None:
         return state
     last_attempt = state.get("last_attempt")
     if last_attempt is not None:
@@ -203,17 +204,29 @@ def refresh_today_lessons(cfg, state):
         save_json(cfg["state_file"], state)
         return state
     day_events = [e for e in events if e.start_time.date().isoformat() == today]
+    # preserve in-progress/closed lessons across a refetch (a forced /refresh
+    # mid-day must not reopen an already-closed lesson or reset an ongoing
+    # checkin's present_uids back to empty) — match old entries by identity
+    old_by_key = {}
+    if state.get("date") == today:
+        for lsn in state.get("lessons") or []:
+            old_by_key[(lsn["subject"], lsn["start"], lsn["end"])] = lsn
     lessons = []
     for e in sorted(day_events, key=lambda x: x.start_time):
-        lessons.append({
-            "subject": e.subject,
-            "start": e.start_time.isoformat(),
-            "end": e.end_time.isoformat(),
-            "opened": False,
-            "closed": False,
-            "thread_id": None,
-            "present_uids": [],
-        })
+        key = (e.subject, e.start_time.isoformat(), e.end_time.isoformat())
+        old = old_by_key.get(key)
+        if old is not None:
+            lessons.append(old)
+        else:
+            lessons.append({
+                "subject": e.subject,
+                "start": e.start_time.isoformat(),
+                "end": e.end_time.isoformat(),
+                "opened": False,
+                "closed": False,
+                "thread_id": None,
+                "present_uids": [],
+            })
     state = {"date": today, "lessons": lessons}
     save_json(cfg["state_file"], state)
     print(f"cached {len(lessons)} lessons for today", flush=True)
@@ -675,11 +688,12 @@ def handle_owner_command(cfg, msg, roster, student_map, state, rollcall):
             except Exception as e:
                 reply = f"Не получилось: {e}"
     elif cmd == "/refresh":
-        state["date"] = None
-        state["lessons"] = None
+        state["force_refresh"] = True
         state["last_attempt"] = None
         save_json(cfg["state_file"], state)
-        reply = "Кеш расписания сброшен, обновление запустится в течение минуты."
+        reply = ("Расписание обновится в течение минуты. Уже открытые/закрытые "
+                 "пары и текущие отметки не тронет — обновятся только новые или "
+                 "изменившиеся пары.")
     elif cmd in ("/links", "/ссылки"):
         subjects = list(load_topic_subjects(cfg))
         links = load_json(cfg["conf_links_file"], {})
