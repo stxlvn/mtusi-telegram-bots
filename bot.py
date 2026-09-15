@@ -34,6 +34,11 @@ VENV_PY = sys.executable
 LMS_SCRAPE_AT = (7, 35)
 LMS_MATERIALS_AT = (7, 45)
 SCHEDULE_POST_AT = (8, 0)
+# some conference types (BigBlueButton Cloud) only expose their join link once
+# the teacher actually opens the meeting, which doesn't reliably happen right
+# at the scheduled start — keep re-checking a still-open lesson's link every
+# few minutes instead of trying just once at open time.
+CONF_LINK_RECHECK_SEC = 300
 
 
 def spawn(script, *args, log=None):
@@ -262,14 +267,6 @@ def open_lesson(cfg, lesson, roster):
     lesson["checkin_message_id"] = result["message_id"]
     lesson["opened"] = True
     print(f"opened checkin for '{lesson['subject']}'", flush=True)
-
-    # some LMS conference types (BigBlueButton Cloud) only expose their real
-    # join link once the meeting's own scheduled window opens — too late for
-    # the once-a-day morning scrape. Re-check that one subject right now.
-    try:
-        spawn(LMS_SCRAPER, "--subject", lesson["subject"], log=LMS_LOG)
-    except Exception as e:
-        print(f"spawn per-lesson LMS re-check failed: {e}", flush=True)
 
 
 def close_lesson(cfg, lesson, roster):
@@ -807,6 +804,18 @@ def main():
                 if lesson["opened"] and not lesson["closed"] and now >= end:
                     close_lesson(cfg, lesson, roster)
                     changed = True
+                if lesson["opened"] and not lesson["closed"]:
+                    last_check = lesson.get("last_conf_check")
+                    due = (last_check is None or
+                           (now - datetime.fromisoformat(last_check)).total_seconds()
+                           >= CONF_LINK_RECHECK_SEC)
+                    if due:
+                        lesson["last_conf_check"] = now.isoformat()
+                        changed = True
+                        try:
+                            spawn(LMS_SCRAPER, "--subject", lesson["subject"], log=LMS_LOG)
+                        except Exception as e:
+                            print(f"spawn per-lesson LMS re-check failed: {e}", flush=True)
             if changed:
                 save_json(cfg["state_file"], state)
 
