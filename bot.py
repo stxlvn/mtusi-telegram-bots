@@ -543,6 +543,7 @@ def conf_links_keyboard(subjects, links):
         mark = "✅" if subj in links else "➕"
         rows.append([{"text": f"{mark} {subj}"[:64], "callback_data": f"cl:s:{i}"}])
     rows.append([{"text": "▶️ Спарсить LMS сейчас", "callback_data": "cl:scan"}])
+    rows.append([{"text": "📎 Спарсить материалы сейчас", "callback_data": "cl:materials"}])
     rows.append([{"text": "✖️ Закрыть", "callback_data": "cl:x"}])
     return {"inline_keyboard": rows}
 
@@ -595,6 +596,12 @@ def handle_conf_link_callback(cfg, cq, state):
     elif data == "cl:scan":
         try:
             spawn(LMS_SCRAPER, "--report", log=LMS_LOG)
+            ack("Запущено — результат придёт в личку через пару минут")
+        except Exception as e:
+            ack(f"Не вышло: {e}")
+    elif data == "cl:materials":
+        try:
+            spawn(LMS_MATERIALS, "--report", log=LMS_MATERIALS_LOG)
             ack("Запущено — результат придёт в личку через пару минут")
         except Exception as e:
             ack(f"Не вышло: {e}")

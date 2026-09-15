@@ -157,6 +157,8 @@ def main():
     print(f"done, {new_count} new materials posted", flush=True)
     if new_count and cfg.get("owner_telegram_id"):
         ls.notify_owner(cfg, f"📎 Автопарсер LMS: разослал {new_count} новых материалов по темам.")
+    elif "--report" in sys.argv:
+        ls.notify_owner(cfg, "📎 Прогнал парсер материалов: новых файлов нет.")
 
 
 if __name__ == "__main__":
