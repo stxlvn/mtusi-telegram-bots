@@ -51,8 +51,12 @@ MOD_RE = re.compile(
     r"/view\.php\?id=\d+", re.I)
 # BigBlueButton Cloud (and similar) render their real join link only once the
 # meeting's scheduled window is open — grab whatever the "join" button points
-# to by its visible text rather than guessing a URL pattern, since the
-# provider domain isn't fixed the way ktalk.ru is.
+# to instead of guessing a URL pattern, since the provider domain isn't fixed
+# the way ktalk.ru is. The button is marked with data-action="join" (an icon,
+# not necessarily matching text — confirmed live: <a href="…bbb_view.php?
+# action=join&id=…" data-action="join">), so match the whole tag and pull
+# href out of it rather than anchoring on visible text.
+JOIN_TAG_RE = re.compile(r'<a\s[^>]*data-action="join"[^>]*>', re.I)
 JOIN_TEXT_RE = re.compile(
     r'<a[^>]+href="([^"]+)"[^>]*>\s*(?:<[^>]+>\s*)*'
     r'(?:Присоединиться|Войти в конференцию|Join session|Start session)', re.I)
@@ -182,6 +186,11 @@ def course_conf_link(sess, viewurl):
         k = KTALK_RE.search(mr.text)
         if k:
             return k.group(0)
+        tag = JOIN_TAG_RE.search(mr.text)
+        if tag:
+            href = re.search(r'href="([^"]+)"', tag.group(0))
+            if href:
+                return html.unescape(href.group(1))
         j = JOIN_TEXT_RE.search(mr.text)
         if j:
             return html.unescape(j.group(1))
