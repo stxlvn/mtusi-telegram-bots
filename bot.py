@@ -39,6 +39,11 @@ SCHEDULE_POST_AT = (8, 0)
 # at the scheduled start — keep re-checking a still-open lesson's link every
 # few minutes instead of trying just once at open time.
 CONF_LINK_RECHECK_SEC = 60
+# a teacher may sign off their own ведомость well before the scheduled end —
+# push attendance early instead of only trying once right at close, so there's
+# still a real chance of finding it open. The close-time push still happens
+# too, to pick up anyone who checked in during the last half hour.
+LK_EARLY_SUBMIT_BEFORE_END = timedelta(minutes=30)
 
 
 def spawn(script, *args, log=None):
@@ -275,9 +280,7 @@ def open_lesson(cfg, lesson, roster):
         message_thread_id=thread_id,
         text=(
             "🖊 <b>Отметка присутствия</b>\n"
-            f"Нажми своё имя в списке ниже до {end_time.strftime('%H:%M')}, чтобы отметиться на паре.\n"
-            "Если тебя нет в списке зарегистрированных — сначала нажми своё имя в закреплённом "
-            "сообщении в топике «Обьявления»."
+            f"Нажми своё имя в списке ниже до {end_time.strftime('%H:%M')}, чтобы отметиться на паре."
         ),
         parse_mode="HTML",
         reply_markup=json.dumps(build_lesson_checkin_keyboard(roster, lesson["present_uids"])),
@@ -312,15 +315,23 @@ def close_lesson(cfg, lesson, roster):
             print(f"delete old checkin message failed: {e}", flush=True)
     lesson["closed"] = True
     print(f"closed checkin for '{lesson['subject']}': {len(present_fio)}/{len(roster)}", flush=True)
+    submit_lk_attendance(cfg, lesson, present)
 
+
+def submit_lk_attendance(cfg, lesson, present_uids):
+    """Push present_uids to the official ведомость and DM the owner the result.
+    Called both at the early (LK_EARLY_SUBMIT_BEFORE_END) and final (lesson
+    close) points — a teacher may close their own ведомость well before the
+    scheduled end, so an early attempt has better odds of finding it still
+    open; the close-time call catches anyone who checked in after that."""
     try:
         report = asyncio.run(lk_attendance.submit(
-            lesson["subject"], lesson["start"], lesson["end"], list(present)))
+            lesson["subject"], lesson["start"], lesson["end"], list(present_uids)))
     except Exception as e:
         report = {"ok": False, "error": str(e), "marked": [], "not_in_sheet": []}
 
     if report["ok"]:
-        owner_msg = (f"✅ ЛК МТУСИ: отметил {len(report['marked'])}/{len(present)} "
+        owner_msg = (f"✅ ЛК МТУСИ: отметил {len(report['marked'])}/{len(present_uids)} "
                      f"по «{lesson['subject']}»")
         if report["not_in_sheet"]:
             owner_msg += f"\n⚠️ не нашёл в ведомости: {len(report['not_in_sheet'])} uid"
@@ -332,6 +343,7 @@ def close_lesson(cfg, lesson, roster):
             tg_api(cfg, "sendMessage", chat_id=cfg["owner_telegram_id"], text=owner_msg)
         except Exception:
             pass
+    return report
 
 
 def handle_lesson_checkin(cfg, cq, uid, roster, student_map, state):
@@ -822,6 +834,12 @@ def main():
                 if lesson["opened"] and not lesson["closed"] and now >= end:
                     close_lesson(cfg, lesson, roster)
                     changed = True
+                if (lesson["opened"] and not lesson["closed"]
+                        and not lesson.get("lk_early_submitted")
+                        and now >= end - LK_EARLY_SUBMIT_BEFORE_END):
+                    lesson["lk_early_submitted"] = True
+                    changed = True
+                    submit_lk_attendance(cfg, lesson, lesson["present_uids"])
                 if lesson["opened"] and not lesson["closed"] and not _conf_link_fresh(cfg, lesson, start):
                     last_check = lesson.get("last_conf_check")
                     due = (last_check is None or
