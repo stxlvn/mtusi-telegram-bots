@@ -41,6 +41,9 @@ DEBUG_CHAT_ID = int(os.environ["DEBUG_CHAT_ID"]) if os.environ.get("DEBUG_CHAT_I
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(SCRIPT_DIR, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 TOPICS_FILE = os.environ.get("TOPICS_FILE", os.path.join(DATA_DIR, "topics.json"))
+# {"<subject as lk.mtuci.ru names it>": "<existing topic subject>"}
+SUBJECT_ALIASES_FILE = os.environ.get("SUBJECT_ALIASES_FILE",
+                                      os.path.join(DATA_DIR, "subject_aliases.json"))
 PIN_STATE_FILE = os.environ.get("PIN_STATE_FILE", os.path.join(DATA_DIR, "pinned_schedule.json"))
 
 MSK_OFFSET = timedelta(hours=3)
@@ -122,9 +125,19 @@ def tg_api(method, **params):
     return result["result"]
 
 
+def topic_subject(subject):
+    """Map a schedule subject onto the topic subject it is posted under, for
+    when lk.mtuci.ru's name differs from the group's existing topic."""
+    if os.path.exists(SUBJECT_ALIASES_FILE):
+        with open(SUBJECT_ALIASES_FILE, encoding="utf-8") as f:
+            return json.load(f).get(subject, subject)
+    return subject
+
+
 # Not called from main() below — kept as a public helper for other tools that post
 # into per-subject topics (e.g. a companion attendance bot).
 def ensure_topic(subject):
+    subject = topic_subject(subject)
     topics = load_topics()
     if subject in topics:
         return topics[subject]

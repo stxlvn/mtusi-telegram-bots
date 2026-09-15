@@ -16,7 +16,7 @@ DATA_DIR = os.environ.get("DATA_DIR", os.path.join(SCRIPT_DIR, "data"))
 sys.path.insert(0, SCRIPT_DIR)
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
-from telegram_post import ensure_topic  # noqa: E402
+from telegram_post import ensure_topic, topic_subject  # noqa: E402
 from telegram_post import fetch_events_retrying  # noqa: E402
 from telegram_post import tg_api as schedule_tg_api  # noqa: E402
 
@@ -95,7 +95,7 @@ def _conf_link_fresh(cfg, lesson, start):
     left over from an earlier one (BBB Cloud mints a new meeting id per
     lesson). Stops the once-a-minute recheck as soon as that happens; a later
     lesson has its own later `start`, so it naturally starts rechecking again."""
-    entry = load_json(cfg["conf_links_file"], {}).get(lesson["subject"])
+    entry = load_json(cfg["conf_links_file"], {}).get(topic_subject(lesson["subject"]))
     if not entry or not entry.get("updated"):
         return False
     try:
@@ -831,7 +831,8 @@ def main():
                         lesson["last_conf_check"] = now.isoformat()
                         changed = True
                         try:
-                            spawn(LMS_SCRAPER, "--subject", lesson["subject"], log=LMS_LOG)
+                            spawn(LMS_SCRAPER, "--subject", topic_subject(lesson["subject"]),
+                                  log=LMS_LOG)
                         except Exception as e:
                             print(f"spawn per-lesson LMS re-check failed: {e}", flush=True)
             if changed:
