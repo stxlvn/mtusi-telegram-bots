@@ -21,7 +21,9 @@ Not a standalone job — bot.py's close_lesson() calls submit() right when a
 lesson's Telegram check-in window closes.
 """
 import asyncio
+import html
 import os
+import re
 import sys
 from datetime import datetime
 
@@ -70,23 +72,36 @@ def _time_label(start_iso, end_iso):
     return f"{s}-{e}"
 
 
+def _ref_name(value):
+    """A cell is usually a {"name": ...} ref, but may come as rendered HTML."""
+    if isinstance(value, dict):
+        return value.get("name")
+    if isinstance(value, str):
+        return html.unescape(re.sub(r"<[^>]+>", "", value)).strip()
+    return None
+
+
 async def _find_sheet(page, subject, start_iso, end_iso):
     day = datetime.fromisoformat(start_iso).strftime("%Y%m%d")
     label = _time_label(start_iso, end_iso)
-    result = await _call(page, "getData_CurrentArrayEducationAttendance",
-                         {"ФильтрУслуг": 1, "ЭтоКуратор": True, "НомерСтраницы": 0})
-    rows = result["data"]["Ответ"]["ТаблицаДанных"]
-    for row in rows:
-        if row.get("Дисциплина", {}).get("name") != subject:
-            continue
-        if row.get("ХарактеристикаЗанятия", {}).get("name") != label:
-            continue
-        if not row.get("ДатаЗанятия", "").startswith(day):
-            continue
-        for cmd in row.get("data", {}).get("command", []):
-            reg = cmd.get("ПараметрыКоманды", {}).get("РегистраторВедомости")
-            if reg:
-                return reg
+    page_num, page_count = 0, 1
+    while page_num < page_count:
+        result = await _call(page, "getData_CurrentArrayEducationAttendance",
+                             {"ФильтрУслуг": 1, "ЭтоКуратор": True, "НомерСтраницы": page_num})
+        answer = result["data"]["Ответ"]
+        page_count = int((answer.get("Пагинатор") or {}).get("КоличествоСтраниц") or 1)
+        for row in answer["ТаблицаДанных"]:
+            if _ref_name(row.get("Дисциплина")) != subject:
+                continue
+            if _ref_name(row.get("ХарактеристикаЗанятия")) != label:
+                continue
+            if not str(row.get("ДатаЗанятия", "")).startswith(day):
+                continue
+            for cmd in row.get("data", {}).get("command", []):
+                reg = cmd.get("ПараметрыКоманды", {}).get("РегистраторВедомости")
+                if reg:
+                    return reg
+        page_num += 1
     return None
 
 
