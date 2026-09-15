@@ -89,6 +89,24 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
+def _conf_link_fresh(cfg, lesson, start):
+    """True once conf_links.json has a link for this subject that was found
+    at/after this lesson's own start — i.e. found for THIS occurrence, not
+    left over from an earlier one (BBB Cloud mints a new meeting id per
+    lesson). Stops the once-a-minute recheck as soon as that happens; a later
+    lesson has its own later `start`, so it naturally starts rechecking again."""
+    entry = load_json(cfg["conf_links_file"], {}).get(lesson["subject"])
+    if not entry or not entry.get("updated"):
+        return False
+    try:
+        updated = datetime.fromisoformat(entry["updated"])
+        if updated.tzinfo is not None:
+            updated = updated.replace(tzinfo=None)
+        return updated >= start
+    except Exception:
+        return False
+
+
 def msk_now():
     # naive, MSK wall-clock — matches the scraper's naive lesson start/end
     # datetimes (scraped straight off the site's local-time display), so the
@@ -804,7 +822,7 @@ def main():
                 if lesson["opened"] and not lesson["closed"] and now >= end:
                     close_lesson(cfg, lesson, roster)
                     changed = True
-                if lesson["opened"] and not lesson["closed"]:
+                if lesson["opened"] and not lesson["closed"] and not _conf_link_fresh(cfg, lesson, start):
                     last_check = lesson.get("last_conf_check")
                     due = (last_check is None or
                            (now - datetime.fromisoformat(last_check)).total_seconds()
