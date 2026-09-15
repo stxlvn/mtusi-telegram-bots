@@ -263,6 +263,14 @@ def open_lesson(cfg, lesson, roster):
     lesson["opened"] = True
     print(f"opened checkin for '{lesson['subject']}'", flush=True)
 
+    # some LMS conference types (BigBlueButton Cloud) only expose their real
+    # join link once the meeting's own scheduled window opens — too late for
+    # the once-a-day morning scrape. Re-check that one subject right now.
+    try:
+        spawn(LMS_SCRAPER, "--subject", lesson["subject"], log=LMS_LOG)
+    except Exception as e:
+        print(f"spawn per-lesson LMS re-check failed: {e}", flush=True)
+
 
 def close_lesson(cfg, lesson, roster):
     present = set(lesson["present_uids"])

@@ -12,9 +12,14 @@ a minimal Playwright sequence through the proxy, then hand the resulting
 cookies to a plain ``requests`` session for the rest — course listing via
 Moodle's AJAX endpoint, course/module pages.
 
-bot.py's main loop spawns this once a day; also runnable standalone.
+bot.py's main loop spawns this once a day, and once more per-subject right
+when that subject's lesson opens (``--subject <name>``) — some conference
+types (BigBlueButton Cloud) only expose their real join link once the
+meeting's own scheduled window opens, too late for the morning scrape.
+Also runnable standalone.
 """
 import asyncio
+import html
 import os
 import re
 import sys
@@ -42,8 +47,16 @@ KTALK_RE = re.compile(
     r"|https://[a-z0-9.-]*zoom\.[a-z]+/j/[0-9]+(?:\?pwd=[A-Za-z0-9._-]+)?"
     r"|https://[a-z0-9.-]*bbb[a-z0-9.-]*/[A-Za-z0-9/_?=&.-]+", re.I)
 MOD_RE = re.compile(
-    r"https://lms\.mtuci\.ru/(?:lms/)?mod/(?:konturtalk|bigbluebuttonbn|zoom|url)"
+    r"https://lms\.mtuci\.ru/(?:lms/)?mod/(?:konturtalk|bigbluebuttonbn|bigbluebuttoncloud|zoom|url)"
     r"/view\.php\?id=\d+", re.I)
+# BigBlueButton Cloud (and similar) render their real join link only once the
+# meeting's scheduled window is open — grab whatever the "join" button points
+# to by its visible text rather than guessing a URL pattern, since the
+# provider domain isn't fixed the way ktalk.ru is.
+JOIN_TEXT_RE = re.compile(
+    r'<a[^>]+href="([^"]+)"[^>]*>\s*(?:<[^>]+>\s*)*'
+    r'(?:Присоединиться|Войти в конференцию|Join session|Start session)', re.I)
+BBB_NOT_STARTED_RE = re.compile(r"собрание ещ[её] не начал", re.I)
 
 
 class LMSError(Exception):
@@ -169,8 +182,13 @@ def course_conf_link(sess, viewurl):
         k = KTALK_RE.search(mr.text)
         if k:
             return k.group(0)
+        j = JOIN_TEXT_RE.search(mr.text)
+        if j:
+            return html.unescape(j.group(1))
         if "/mod/url/" in mod_url and KTALK_RE.search(mr.url):
             return mr.url
+        if BBB_NOT_STARTED_RE.search(mr.text):
+            print(f"  BBB meeting not open yet, no link to grab: {mod_url}", flush=True)
     return None
 
 
@@ -187,7 +205,54 @@ def scrape():
     return found
 
 
+def scrape_one_subject(subject):
+    """Re-scan just one subject's course — used right when its lesson opens,
+    since some conference types (BigBlueButton Cloud) only expose their real
+    join link once the meeting's scheduled window is active, too late for the
+    once-a-day morning scrape."""
+    sess = login()
+    group = os.environ.get("GROUP_LABEL", "")
+    best = None
+    for course_name, viewurl in list_courses(sess):
+        clean = re.sub(r"\s*\([^)]*\)", "", course_name).strip()
+        if bot.match_subject(clean, [subject]) != subject:
+            continue
+        if best is None or (group and group in course_name and group not in best[0]):
+            best = (course_name, viewurl)
+    if not best:
+        return None
+    return course_conf_link(sess, best[1])
+
+
+def _main_one_subject(subject):
+    cfg = bot.load_config()
+    try:
+        url = scrape_one_subject(subject)
+    except LMSError as e:
+        print(f"subject scrape failed for '{subject}': {e}", flush=True)
+        return
+    if not url:
+        print(f"no conf link found yet for '{subject}'", flush=True)
+        return
+    links = bot.load_json(cfg["conf_links_file"], {})
+    if links.get(subject, {}).get("url") == url:
+        print(f"'{subject}' unchanged", flush=True)
+        return
+    msg = bot.set_conf_link(cfg, subject, url)
+    cur = bot.load_json(cfg["conf_links_file"], {})
+    if subject in cur:
+        cur[subject]["auto"] = True
+        bot.save_json(cfg["conf_links_file"], cur)
+    print(msg, flush=True)
+    notify_owner(cfg, f"🎥 Обновил ссылку по «{subject}» перед парой:\n{url}")
+
+
 def main():
+    if "--subject" in sys.argv:
+        idx = sys.argv.index("--subject")
+        _main_one_subject(sys.argv[idx + 1])
+        return
+
     cfg = bot.load_config()
     try:
         result = scrape()
