@@ -38,7 +38,7 @@ SCHEDULE_POST_AT = (8, 0)
 # the teacher actually opens the meeting, which doesn't reliably happen right
 # at the scheduled start — keep re-checking a still-open lesson's link every
 # few minutes instead of trying just once at open time.
-CONF_LINK_RECHECK_SEC = 300
+CONF_LINK_RECHECK_SEC = 60
 
 
 def spawn(script, *args, log=None):
