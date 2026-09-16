@@ -384,9 +384,15 @@ class MTUCIAuthenticator:
         if error_msg := await self._check_error_messages(page):
             self._raise_auth_error(AuthenticationError.LOGIN_FAILED, error_msg)
 
-        await asyncio.sleep(2)
-        if not await self._check_auth_state(page):
-            self._raise_auth_error(AuthenticationError.FAILED_AUTH_STATE)
+        # A single check right after submission races the post-login redirect
+        # chain (Keycloak -> lk.mtuci.ru) often enough to be a real problem —
+        # observed failing "Failed to verify authentication state" on a login
+        # that in fact succeeded moments later. Poll instead of one check.
+        for _ in range(5):
+            await asyncio.sleep(1.5)
+            if await self._check_auth_state(page):
+                return
+        self._raise_auth_error(AuthenticationError.FAILED_AUTH_STATE)
 
     async def authenticate(self, page: Page) -> None:
         """
