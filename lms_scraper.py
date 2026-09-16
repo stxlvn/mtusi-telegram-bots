@@ -27,6 +27,8 @@ import time
 
 import requests
 from playwright.async_api import async_playwright
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -143,6 +145,15 @@ def login(attempts=3, delay_sec=10):
             sess = requests.Session()
             sess.proxies = {"http": PROXY, "https": PROXY}
             sess.headers["User-Agent"] = UA
+            # the RU proxy hop (home router) occasionally drops a single
+            # request (observed: a "Read timed out" mid-scrape) — everything
+            # after login is read-only, so a transient network retry here is
+            # safe regardless of GET/POST.
+            retry = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504],
+                         allowed_methods=frozenset(["GET", "POST"]))
+            adapter = HTTPAdapter(max_retries=retry)
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
             for c in cookies:
                 sess.cookies.set(c["name"], c["value"], domain=c["domain"],
                                  path=c.get("path", "/"))
