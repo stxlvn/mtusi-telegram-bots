@@ -191,9 +191,19 @@ def list_courses(sess):
 
 
 def course_conf_link(sess, viewurl):
+    # Activities accumulate over the semester, oldest first in page order, so
+    # scan newest-first and return on the first match: that's both the
+    # current link (a teacher can repurpose an old activity for a new link)
+    # and a short-circuit, so one broken/timed-out old activity can't wipe
+    # out a link already found from a newer one.
     r = sess.get(viewurl, timeout=30)
-    for mod_url in dict.fromkeys(m.group(0) for m in MOD_RE.finditer(r.text)):
-        mr = sess.get(mod_url, timeout=30)
+    mod_urls = list(dict.fromkeys(m.group(0) for m in MOD_RE.finditer(r.text)))
+    for mod_url in reversed(mod_urls):
+        try:
+            mr = sess.get(mod_url, timeout=30)
+        except Exception as e:
+            print(f"  activity fetch failed, skipping: {mod_url}: {e}", flush=True)
+            continue
         k = KTALK_RE.search(mr.text)
         if k:
             return k.group(0)

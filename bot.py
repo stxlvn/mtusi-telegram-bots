@@ -28,22 +28,24 @@ LMS_MATERIALS = os.path.join(SCRIPT_DIR, "lms_materials.py")
 LMS_MATERIALS_LOG = os.path.join(DATA_DIR, "lms_materials.log")
 SCHEDULE_SCRIPT = os.path.join(SCRIPT_DIR, "telegram_post.py")
 SCHEDULE_LOG = os.path.join(DATA_DIR, "schedule.log")
+VIDEO_BOT_SCRIPT = os.path.join(SCRIPT_DIR, "video_bot.py")
+VIDEO_BOT_LOG = os.path.join(DATA_DIR, "video_bot.log")
 VENV_PY = sys.executable
 
 # daily jobs folded into the main loop (no cron); MSK HH:MM triggers
 LMS_SCRAPE_AT = (7, 35)
 LMS_MATERIALS_AT = (7, 45)
 SCHEDULE_POST_AT = (8, 0)
+VIDEO_BOT_POLL_INTERVAL_SEC = 300
 # some conference types (BigBlueButton Cloud) only expose their join link once
 # the teacher actually opens the meeting, which doesn't reliably happen right
 # at the scheduled start — keep re-checking a still-open lesson's link every
 # few minutes instead of trying just once at open time.
 CONF_LINK_RECHECK_SEC = 60
-# a teacher may sign off their own ведомость well before the scheduled end —
-# push attendance early instead of only trying once right at close, so there's
-# still a real chance of finding it open. The close-time push still happens
-# too, to pick up anyone who checked in during the last half hour.
+# push attendance 30 min before scheduled end, then again at close.
 LK_EARLY_SUBMIT_BEFORE_END = timedelta(minutes=30)
+# separate hourly awareness pass — see check_lk_sheets().
+LK_SHEET_CHECK_INTERVAL_SEC = 3600
 
 
 def spawn(script, *args, log=None):
@@ -319,11 +321,12 @@ def close_lesson(cfg, lesson, roster):
 
 
 def submit_lk_attendance(cfg, lesson, present_uids):
-    """Push present_uids to the official ведомость and DM the owner the result.
-    Called both at the early (LK_EARLY_SUBMIT_BEFORE_END) and final (lesson
-    close) points — a teacher may close their own ведомость well before the
-    scheduled end, so an early attempt has better odds of finding it still
-    open; the close-time call catches anyone who checked in after that."""
+    """Push present_uids to the official ведомость. Called at the two fixed
+    points (30 min before end, and at close) — see LK_EARLY_SUBMIT_BEFORE_END.
+    DMs the owner either way; the group chat only ever hears about the
+    lesson's official result via close_lesson's own "Итог по паре" post, not
+    from here — an intermediate 30-min-early push repeating that in the
+    topic mid-lesson would just be redundant chatter."""
     try:
         report = asyncio.run(lk_attendance.submit(
             lesson["subject"], lesson["start"], lesson["end"], list(present_uids)))
@@ -346,12 +349,40 @@ def submit_lk_attendance(cfg, lesson, present_uids):
     return report
 
 
+def check_lk_sheets(cfg, state):
+    """Hourly (+ once at day start, since state's daily rebuild drops this
+    flag along with the others) awareness pass: one login, list every
+    currently-open ведомость, and note which of today's lessons already has
+    one — just bookkeeping (lesson["lk_sheet_seen"]), doesn't submit anything.
+    Real submission stays on its own fixed schedule in submit_lk_attendance."""
+    try:
+        rows = asyncio.run(lk_attendance.list_open_sheets())
+    except Exception as e:
+        print(f"lk sheet availability check failed: {e}", flush=True)
+        return False
+    changed = False
+    today = msk_now().date().strftime("%Y%m%d")
+    for lesson in state.get("lessons") or []:
+        if lesson.get("lk_sheet_seen"):
+            continue
+        label = lk_attendance._time_label(lesson["start"], lesson["end"])
+        for row in rows:
+            if (row["subject"] == lesson["subject"] and row["label"] == label
+                    and row["date"].startswith(today)):
+                lesson["lk_sheet_seen"] = True
+                changed = True
+                print(f"ведомость появилась для «{lesson['subject']}» {label} "
+                      f"— учтено, отправлю по расписанию", flush=True)
+                break
+    return changed
+
+
 def handle_lesson_checkin(cfg, cq, uid, roster, student_map, state):
     user_id = str(cq.get("from", {}).get("id"))
     msg = cq.get("message", {})
     thread_id = msg.get("message_thread_id")
 
-    lesson = next((lsn for lsn in state.get("lessons", [])
+    lesson = next((lsn for lsn in state.get("lessons") or []
                     if lsn["opened"] and not lsn["closed"] and lsn["thread_id"] == thread_id), None)
     if lesson is None:
         tg_api(cfg, "answerCallbackQuery", callback_query_id=cq["id"],
@@ -803,7 +834,7 @@ def handle_update(cfg, upd, roster, student_map, state, rollcall, participants):
                    text="Сначала зарегистрируйся: /я Фамилия Имя Отчество",
                    reply_to_message_id=msg["message_id"])
             return
-        for lesson in state.get("lessons", []):
+        for lesson in state.get("lessons") or []:
             if lesson["opened"] and not lesson["closed"] and lesson["thread_id"] == thread_id:
                 if student["uid"] not in lesson["present_uids"]:
                     lesson["present_uids"].append(student["uid"])
@@ -832,7 +863,7 @@ def main():
             state = refresh_today_lessons(cfg, state)
             now = msk_now()
             changed = False
-            for lesson in state.get("lessons", []):
+            for lesson in state.get("lessons") or []:
                 start = datetime.fromisoformat(lesson["start"])
                 end = datetime.fromisoformat(lesson["end"])
                 if not lesson["opened"] and now >= start:
@@ -863,6 +894,17 @@ def main():
             if changed:
                 save_json(cfg["state_file"], state)
 
+            todays_lessons = state.get("lessons") or []
+            lessons_pending = any(not lsn["closed"] for lsn in todays_lessons)
+            last_sheet_check = state.get("last_lk_sheet_check")
+            due = (last_sheet_check is None or
+                   (now - datetime.fromisoformat(last_sheet_check)).total_seconds()
+                   >= LK_SHEET_CHECK_INTERVAL_SEC)
+            if lessons_pending and due:
+                state["last_lk_sheet_check"] = now.isoformat()
+                if check_lk_sheets(cfg, state):
+                    save_json(cfg["state_file"], state)
+
             today = msk_now().date().isoformat()
             hm = (now.hour, now.minute)
 
@@ -883,6 +925,14 @@ def main():
                 save_json(cfg["state_file"], state)
                 print("spawning daily schedule digest", flush=True)
                 spawn(SCHEDULE_SCRIPT, log=SCHEDULE_LOG)
+
+            last_video_check = state.get("last_video_bot_check")
+            if (last_video_check is None or
+                    (now - datetime.fromisoformat(last_video_check)).total_seconds()
+                    >= VIDEO_BOT_POLL_INTERVAL_SEC):
+                state["last_video_bot_check"] = now.isoformat()
+                save_json(cfg["state_file"], state)
+                spawn(VIDEO_BOT_SCRIPT, log=VIDEO_BOT_LOG)
 
             if state.get("last_conf_check") != today:
                 state["last_conf_check"] = today

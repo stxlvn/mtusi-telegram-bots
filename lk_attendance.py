@@ -25,6 +25,7 @@ import html
 import os
 import re
 import sys
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from playwright.async_api import async_playwright
@@ -81,16 +82,46 @@ def _ref_name(value):
     return None
 
 
-async def _find_sheet(page, subject, start_iso, end_iso):
-    day = datetime.fromisoformat(start_iso).strftime("%Y%m%d")
-    label = _time_label(start_iso, end_iso)
+@asynccontextmanager
+async def _authenticated_page(pw):
+    """One browser+login, shared by every entry point below (submit, sheet
+    listing) so the launch/context/auth setup lives in exactly one place."""
+    browser = await pw.chromium.launch(
+        headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+    try:
+        ctx = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
+        page = await ctx.new_page()
+        auth_cfg = AuthConfig(email=MTUCI_EMAIL, password=MTUCI_PASSWORD,
+                              login_url=MTUCI_LOGIN_URL)
+        # authenticate() returns None on success and *raises* on failure —
+        # it does not return a truthy/falsy verdict, so just let it raise
+        await MTUCIAuthenticator(auth_cfg).authenticate(page)
+        yield page
+    finally:
+        await browser.close()
+
+
+async def _iter_attendance_pages(page):
+    """Yield each page's ТаблицаДанных rows across
+    getData_CurrentArrayEducationAttendance's full pagination."""
     page_num, page_count = 0, 1
     while page_num < page_count:
         result = await _call(page, "getData_CurrentArrayEducationAttendance",
                              {"ФильтрУслуг": 1, "ЭтоКуратор": True, "НомерСтраницы": page_num})
         answer = result["data"]["Ответ"]
         page_count = int((answer.get("Пагинатор") or {}).get("КоличествоСтраниц") or 1)
-        for row in answer["ТаблицаДанных"]:
+        yield answer["ТаблицаДанных"]
+        page_num += 1
+
+
+async def _find_sheet(page, subject, start_iso, end_iso):
+    day = datetime.fromisoformat(start_iso).strftime("%Y%m%d")
+    label = _time_label(start_iso, end_iso)
+    async for rows in _iter_attendance_pages(page):
+        for row in rows:
             if _ref_name(row.get("Дисциплина")) != subject:
                 continue
             if _ref_name(row.get("ХарактеристикаЗанятия")) != label:
@@ -101,7 +132,6 @@ async def _find_sheet(page, subject, start_iso, end_iso):
                 reg = cmd.get("ПараметрыКоманды", {}).get("РегистраторВедомости")
                 if reg:
                     return reg
-        page_num += 1
     return None
 
 
@@ -126,20 +156,7 @@ async def _submit_once(subject, start_iso, end_iso, present_uids):
     failure (auth included) — submit() below is what retries."""
     report = {"ok": False, "marked": [], "not_in_sheet": [], "error": None}
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-        try:
-            ctx = await browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            )
-            page = await ctx.new_page()
-            auth_cfg = AuthConfig(email=MTUCI_EMAIL, password=MTUCI_PASSWORD,
-                                  login_url=MTUCI_LOGIN_URL)
-            # authenticate() returns None on success and *raises* on failure —
-            # it does not return a truthy/falsy verdict, so just let it raise
-            await MTUCIAuthenticator(auth_cfg).authenticate(page)
-
+        async with _authenticated_page(pw) as page:
             reg = await _find_sheet(page, subject, start_iso, end_iso)
             if not reg:
                 raise AttendanceError(f"no open ведомость for '{subject}' "
@@ -157,8 +174,26 @@ async def _submit_once(subject, start_iso, end_iso, present_uids):
                 report["marked"].append(row["Обучающийся"]["name"])
             report["ok"] = True
             return report
-        finally:
-            await browser.close()
+
+
+async def list_open_sheets():
+    """List every currently-open ведомость as (subject, date, time label)
+    triples, one login, no marking — used for the hourly awareness pass so
+    the bot notices a sheet has appeared without doing a full per-lesson
+    login/search at every check."""
+    if not MTUCI_EMAIL or not MTUCI_PASSWORD:
+        return []
+    async with async_playwright() as pw:
+        async with _authenticated_page(pw) as page:
+            rows_out = []
+            async for rows in _iter_attendance_pages(page):
+                for row in rows:
+                    rows_out.append({
+                        "subject": _ref_name(row.get("Дисциплина")),
+                        "label": _ref_name(row.get("ХарактеристикаЗанятия")),
+                        "date": str(row.get("ДатаЗанятия", "")),
+                    })
+            return rows_out
 
 
 async def submit(subject, start_iso, end_iso, present_uids, attempts=3, delay_sec=10):
