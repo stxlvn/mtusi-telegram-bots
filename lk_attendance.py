@@ -17,8 +17,9 @@ lk.mtuci.ru is not behind the anti-bot shield lms.mtuci.ru has, so this logs
 in directly from this server (no RU proxy needed) via the same Playwright
 Keycloak auth the schedule scraper uses.
 
-Not a standalone job — bot.py's close_lesson() calls submit() right when a
-lesson's Telegram check-in window closes.
+bot.py spawns this as `lk_attendance.py --submit <subject> <start> <end>
+<uids-json>` (30 min before a lesson ends and again at close) and it DMs the
+owner the result.
 """
 import asyncio
 import html
@@ -223,3 +224,35 @@ async def submit(subject, start_iso, end_iso, present_uids, attempts=3, delay_se
                 await asyncio.sleep(delay_sec)
     report["error"] = str(last_error)
     return report
+
+
+def main():
+    import json
+    import bot  # loads .env; imported here, not at top, since bot imports this module
+
+    global MTUCI_EMAIL, MTUCI_PASSWORD, MTUCI_LOGIN_URL
+    MTUCI_EMAIL = os.environ.get("MTUCI_EMAIL")
+    MTUCI_PASSWORD = os.environ.get("MTUCI_PASSWORD")
+    MTUCI_LOGIN_URL = os.environ.get("MTUCI_LOGIN_URL", MTUCI_LOGIN_URL)
+
+    if sys.argv[1:2] != ["--submit"] or len(sys.argv) != 6:
+        sys.exit("usage: lk_attendance.py --submit <subject> <start_iso> <end_iso> <uids-json>")
+    subject, start_iso, end_iso, uids_json = sys.argv[2:6]
+    present = json.loads(uids_json)
+
+    report = asyncio.run(submit(subject, start_iso, end_iso, present))
+    if report["ok"]:
+        msg = f"✅ ЛК МТУСИ: отметил {len(report['marked'])}/{len(present)} по «{subject}»"
+        if report["not_in_sheet"]:
+            msg += f"\n⚠️ не нашёл в ведомости: {len(report['not_in_sheet'])} uid"
+    else:
+        msg = f"⚠️ Не смог отметить посещаемость в ЛК для «{subject}»: {report['error']}"
+    print(msg.replace("\n", " | "), flush=True)
+
+    cfg = bot.load_config()
+    if cfg.get("owner_telegram_id"):
+        bot.tg_api(cfg, "sendMessage", chat_id=cfg["owner_telegram_id"], text=msg)
+
+
+if __name__ == "__main__":
+    main()

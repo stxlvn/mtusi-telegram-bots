@@ -28,6 +28,8 @@ LMS_MATERIALS = os.path.join(SCRIPT_DIR, "lms_materials.py")
 LMS_MATERIALS_LOG = os.path.join(DATA_DIR, "lms_materials.log")
 SCHEDULE_SCRIPT = os.path.join(SCRIPT_DIR, "telegram_post.py")
 SCHEDULE_LOG = os.path.join(DATA_DIR, "schedule.log")
+LK_ATTENDANCE = os.path.join(SCRIPT_DIR, "lk_attendance.py")
+LK_LOG = os.path.join(DATA_DIR, "lk_attendance.log")
 VIDEO_BOT_SCRIPT = os.path.join(SCRIPT_DIR, "video_bot.py")
 VIDEO_BOT_LOG = os.path.join(DATA_DIR, "video_bot.log")
 VENV_PY = sys.executable
@@ -317,36 +319,14 @@ def close_lesson(cfg, lesson, roster):
             print(f"delete old checkin message failed: {e}", flush=True)
     lesson["closed"] = True
     print(f"closed checkin for '{lesson['subject']}': {len(present_fio)}/{len(roster)}", flush=True)
-    submit_lk_attendance(cfg, lesson, present)
+    submit_lk_attendance(lesson, present)
 
 
-def submit_lk_attendance(cfg, lesson, present_uids):
-    """Push present_uids to the official ведомость. Called at the two fixed
-    points (30 min before end, and at close) — see LK_EARLY_SUBMIT_BEFORE_END.
-    DMs the owner either way; the group chat only ever hears about the
-    lesson's official result via close_lesson's own "Итог по паре" post, not
-    from here — an intermediate 30-min-early push repeating that in the
-    topic mid-lesson would just be redundant chatter."""
-    try:
-        report = asyncio.run(lk_attendance.submit(
-            lesson["subject"], lesson["start"], lesson["end"], list(present_uids)))
-    except Exception as e:
-        report = {"ok": False, "error": str(e), "marked": [], "not_in_sheet": []}
-
-    if report["ok"]:
-        owner_msg = (f"✅ ЛК МТУСИ: отметил {len(report['marked'])}/{len(present_uids)} "
-                     f"по «{lesson['subject']}»")
-        if report["not_in_sheet"]:
-            owner_msg += f"\n⚠️ не нашёл в ведомости: {len(report['not_in_sheet'])} uid"
-    else:
-        owner_msg = f"⚠️ Не смог отметить посещаемость в ЛК для «{lesson['subject']}»: {report['error']}"
-    print(owner_msg.replace("\n", " | "), flush=True)
-    if cfg.get("owner_telegram_id"):
-        try:
-            tg_api(cfg, "sendMessage", chat_id=cfg["owner_telegram_id"], text=owner_msg)
-        except Exception:
-            pass
-    return report
+def submit_lk_attendance(lesson, present_uids):
+    """Browser login + marking takes seconds (tens with retries), so run it
+    detached like the other jobs — the poll loop keeps serving check-ins."""
+    spawn(LK_ATTENDANCE, "--submit", lesson["subject"], lesson["start"], lesson["end"],
+          json.dumps(sorted(present_uids)), log=LK_LOG)
 
 
 def check_lk_sheets(cfg, state):
@@ -877,7 +857,7 @@ def main():
                         and now >= end - LK_EARLY_SUBMIT_BEFORE_END):
                     lesson["lk_early_submitted"] = True
                     changed = True
-                    submit_lk_attendance(cfg, lesson, lesson["present_uids"])
+                    submit_lk_attendance(lesson, lesson["present_uids"])
                 if lesson["opened"] and not lesson["closed"] and not _conf_link_fresh(cfg, lesson, start):
                     last_check = lesson.get("last_conf_check")
                     due = (last_check is None or

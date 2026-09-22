@@ -11,6 +11,9 @@ import urllib.parse
 import urllib.request
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "video_bot_config.json")
 
@@ -121,7 +124,11 @@ def resolve_tags(subject, live_tag_map, fallback_tag_map):
 
 def load_config():
     with open(CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    cfg["yandex_token"] = os.environ["YANDEX_DISK_TOKEN"]
+    cfg["telegram"]["bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"]
+    cfg["telegram"]["chat_id"] = int(os.environ["TELEGRAM_CHAT_ID"])
+    return cfg
 
 
 def load_state(path):
