@@ -9,6 +9,8 @@ import requests
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
+import ru_proxy
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
@@ -68,6 +70,7 @@ async def fetch_events():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
+            proxy=ru_proxy.browser_proxy(),
             args=["--no-sandbox", "--disable-setuid-sandbox"],
         )
         try:
@@ -77,6 +80,7 @@ async def fetch_events():
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                 ),
             )
+            await ru_proxy.prepare(context)
             page = await context.new_page()
             events = await scraper.parse_schedule(page)
         finally:

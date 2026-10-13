@@ -13,9 +13,8 @@ POST /ilk/x/getProcessor {"processor": "<name>", ...params}
                                                ФизическиеЛица catalog, verified)
 - update_ScoreToLineAttendance             -> mark ONE student present
 
-lk.mtuci.ru is not behind the anti-bot shield lms.mtuci.ru has, so this logs
-in directly from this server (no RU proxy needed) via the same Playwright
-Keycloak auth the schedule scraper uses.
+lk.mtuci.ru rejects non-RU IPs (403), so this logs in through the RU proxy
+(``LMS_PROXY``) via the same Playwright Keycloak auth the schedule scraper uses.
 
 bot.py spawns this as `lk_attendance.py --submit <subject> <start> <end>
 <uids-json>` (30 min before a lesson ends and again at close) and it DMs the
@@ -30,6 +29,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from playwright.async_api import async_playwright
+
+import ru_proxy
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -88,12 +89,14 @@ async def _authenticated_page(pw):
     """One browser+login, shared by every entry point below (submit, sheet
     listing) so the launch/context/auth setup lives in exactly one place."""
     browser = await pw.chromium.launch(
-        headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+        headless=True, proxy=ru_proxy.browser_proxy(),
+        args=["--no-sandbox", "--disable-setuid-sandbox"])
     try:
         ctx = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         )
+        await ru_proxy.prepare(ctx)
         page = await ctx.new_page()
         auth_cfg = AuthConfig(email=MTUCI_EMAIL, password=MTUCI_PASSWORD,
                               login_url=MTUCI_LOGIN_URL)

@@ -140,6 +140,12 @@ class MTUCIAuthenticator:
                 self._logger.debug("Login form found, not authenticated")
                 return False
 
+            # Keycloak only redirects to /student after a successful login; the
+            # SPA there can take longer to render than we poll for.
+            if page.url.startswith("https://lk.mtuci.ru/student"):
+                self._logger.info("Landed on the student area")
+                return True
+
             # Third check - look for the username in the header
             try:
                 username_el = await page.query_selector(".user-panel h4")

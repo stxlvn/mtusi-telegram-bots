@@ -30,6 +30,8 @@ from playwright.async_api import async_playwright
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+import ru_proxy
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 import bot  # noqa: E402
@@ -39,7 +41,6 @@ LOGIN_URL = f"{LMS}/login/index.php"
 DASH_URL = f"{LMS}/lms/my/"
 COURSELIST_METHOD = "core_course_get_enrolled_courses_by_timeline_classification"
 
-PROXY = os.environ.get("LMS_PROXY", "socks5h://127.0.0.1:1081")
 UA = os.environ.get(
     "LMS_UA",
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
@@ -92,13 +93,13 @@ async def _browser_login_cookies():
     if not email or not password:
         raise LMSError("MTUCI_EMAIL / MTUCI_PASSWORD not set")
 
-    proxy_server = PROXY.replace("socks5h://", "socks5://")
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            headless=True, proxy={"server": proxy_server},
+            headless=True, proxy=ru_proxy.browser_proxy(),
             args=["--no-sandbox", "--disable-setuid-sandbox"])
         try:
             ctx = await browser.new_context(user_agent=UA)
+            await ru_proxy.prepare(ctx)
             page = await ctx.new_page()
             try:
                 await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
@@ -143,7 +144,8 @@ def login(attempts=3, delay_sec=10):
         try:
             cookies = asyncio.run(_browser_login_cookies())
             sess = requests.Session()
-            sess.proxies = {"http": PROXY, "https": PROXY}
+            proxy = ru_proxy.pick()
+            sess.proxies = {"http": proxy, "https": proxy}
             sess.headers["User-Agent"] = UA
             # the RU proxy hop (home router) occasionally drops a single
             # request (observed: a "Read timed out" mid-scrape) — everything
@@ -157,8 +159,11 @@ def login(attempts=3, delay_sec=10):
             for c in cookies:
                 sess.cookies.set(c["name"], c["value"], domain=c["domain"],
                                  path=c.get("path", "/"))
-            if "MoodleSession" not in sess.cookies:
-                raise LMSError("no MoodleSession cookie after SSO")
+            # MoodleSession is set for guests too, so only a sesskey on the
+            # dashboard proves the SSO hop actually completed
+            r = sess.get(DASH_URL, timeout=30)
+            if not re.search(r"\"sesskey\":\"(\w+)\"", r.text):
+                raise LMSError("SSO didn't complete (no sesskey on dashboard)")
             return sess
         except LMSError as e:
             if str(e) == "CAPTCHA":
