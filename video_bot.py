@@ -7,8 +7,6 @@ import subprocess
 import threading
 import time
 import traceback
-import urllib.parse
-import urllib.request
 
 import requests
 from dotenv import load_dotenv
@@ -125,7 +123,7 @@ def resolve_tags(subject, live_tag_map, fallback_tag_map):
 def load_config():
     with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = json.load(f)
-    cfg["yandex_token"] = os.environ["YANDEX_DISK_TOKEN"]
+    cfg.setdefault("remote", "gdrive:")
     cfg["telegram"]["bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"]
     cfg["telegram"]["chat_id"] = int(os.environ["TELEGRAM_CHAT_ID"])
     return cfg
@@ -145,54 +143,34 @@ def save_state(path, state):
     os.replace(tmp, path)
 
 
-def yandex_get(token, url_path, params):
-    url = "https://cloud-api.yandex.net" + url_path + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"Authorization": f"OAuth {token}"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.load(resp)
+def rclone(*args):
+    return subprocess.run(["rclone", *args], capture_output=True, text=True, check=True).stdout
 
 
-def yandex_put(token, url_path, params):
-    url = "https://cloud-api.yandex.net" + url_path + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"Authorization": f"OAuth {token}"}, method="PUT")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.load(resp) if resp.length else {}
+def remote_path(cfg, path):
+    return cfg["remote"] + path.lstrip("/")
 
 
-def ensure_public_url(token, disk_path, existing_url=None):
-    if existing_url:
-        return existing_url
-    yandex_put(token, "/v1/disk/resources/publish", {"path": disk_path})
-    info = yandex_get(token, "/v1/disk/resources", {"path": disk_path})
-    return info.get("public_url")
+def list_video_files(cfg):
+    root = cfg["root_path"]
+    out = rclone("lsjson", "-R", "--files-only", remote_path(cfg, root))
+    return [{"resource_id": "gdrive:" + f["ID"], "path": f"{root}/{f['Path']}",
+             "size": f["Size"], "created": f["ModTime"]}
+            for f in json.loads(out) if f.get("MimeType", "").startswith("video/")]
 
 
-def list_video_files(token, root_path):
-    root_prefix = "disk:" + root_path
-    items = []
-    offset = 0
-    limit = 200
-    while True:
-        d = yandex_get(token, "/v1/disk/resources/files", {
-            "media_type": "video", "limit": limit, "offset": offset, "sort": "-modified",
-        })
-        batch = d.get("items", [])
-        if not batch:
-            break
-        items.extend(batch)
-        offset += limit
-        if len(batch) < limit:
-            break
-    return [it for it in items if it["path"].startswith(root_prefix + "/")]
+def public_url(cfg, path):
+    """Shares the file as "anyone with the link can view" and returns that link."""
+    return rclone("link", remote_path(cfg, path)).strip()
 
 
 def subject_from_path(path, root_path):
-    rel = path[len("disk:" + root_path):].lstrip("/")
+    rel = path[len(root_path):].lstrip("/")
     return rel.split("/")[0]
 
 
 def semester_sort_key(path, root_path):
-    rel = path[len("disk:" + root_path):].lstrip("/")
+    rel = path[len(root_path):].lstrip("/")
     parts = rel.split("/")
     if len(parts) >= 3:
         m = re.match(r"(\d+)_курс_(\d+)_семестр", parts[1])
@@ -202,23 +180,11 @@ def semester_sort_key(path, root_path):
 
 
 def semester_from_path(path, root_path):
-    rel = path[len("disk:" + root_path):].lstrip("/")
+    rel = path[len(root_path):].lstrip("/")
     parts = rel.split("/")
     if len(parts) >= 3:
         return parts[1].replace("_", " ")
     return ""
-
-
-def download_yandex_file(token, disk_path, dest_path):
-    d = yandex_get(token, "/v1/disk/resources/download", {"path": disk_path})
-    href = d["href"]
-    req = urllib.request.Request(href)
-    with urllib.request.urlopen(req, timeout=120) as resp, open(dest_path, "wb") as f:
-        while True:
-            chunk = resp.read(1024 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
 
 
 def ffprobe_duration(path):
@@ -300,7 +266,7 @@ def parse_filename_meta(name):
     return date_str, kind, part
 
 
-def build_caption(subject, semester, filename, tags, yandex_url=None):
+def build_caption(subject, semester, filename, tags, source_url=None):
     name = os.path.splitext(filename)[0]
     date_str, kind, part = parse_filename_meta(name)
     semester_h = humanize_semester(semester) if semester else ""
@@ -316,9 +282,9 @@ def build_caption(subject, semester, filename, tags, yandex_url=None):
         info_bits.append(part)
     lines.append("📹 " + " · ".join(_html.escape(b) for b in info_bits))
 
-    if yandex_url:
+    if source_url:
         lines.append("")
-        lines.append(f'☁️ <a href="{_html.escape(yandex_url)}">Оригинал на Яндекс.Диске</a>')
+        lines.append(f'☁️ <a href="{_html.escape(source_url)}">Оригинал на Google Диске</a>')
 
     if tags:
         lines.append("")
@@ -355,12 +321,12 @@ def send_video(tg_conf, video_path, thumb_path, caption, duration, width, height
     return result
 
 
-def process_item(cfg, token, item, state, live_tag_map):
+def process_item(cfg, item, state, live_tag_map):
     resource_id = item["resource_id"]
     if resource_id in state:
         return
 
-    disk_path = item["path"][len("disk:"):]
+    disk_path = item["path"]
     filename = os.path.basename(disk_path)
     subject = subject_from_path(item["path"], cfg["root_path"])
     semester = semester_from_path(item["path"], cfg["root_path"])
@@ -372,7 +338,7 @@ def process_item(cfg, token, item, state, live_tag_map):
     upload_path = raw_path
 
     print(f"[{filename}] downloading ({item['size']/1024/1024:.1f} MB)...", flush=True)
-    download_yandex_file(token, disk_path, raw_path)
+    rclone("copyto", remote_path(cfg, disk_path), raw_path)
 
     size_mb = os.path.getsize(raw_path) / 1024 / 1024
     if size_mb > cfg["compress_threshold_mb"]:
@@ -385,8 +351,7 @@ def process_item(cfg, token, item, state, live_tag_map):
     width, height = probe_dimensions(upload_path)
     make_thumbnail(upload_path, thumb_path)
 
-    yandex_url = ensure_public_url(token, disk_path, item.get("public_url"))
-    caption = build_caption(subject, semester, filename, tags, yandex_url)
+    caption = build_caption(subject, semester, filename, tags, public_url(cfg, disk_path))
     print(f"[{filename}] uploading to Telegram...", flush=True)
     result = send_video(cfg["telegram"], upload_path, thumb_path, caption, duration, width, height)
     message_id = result["result"]["message_id"]
@@ -401,9 +366,15 @@ def process_item(cfg, token, item, state, live_tag_map):
 
 
 def run_once(cfg):
-    token = cfg["yandex_token"]
     state = load_state(cfg["state_file"])
-    items = list_video_files(token, cfg["root_path"])
+    items = list_video_files(cfg)
+    # lectures posted back when the source was Yandex Disk are known by path only
+    by_path = {e["path"]: e for e in state.values()}
+    adopted = [it for it in items if it["resource_id"] not in state and it["path"] in by_path]
+    for it in adopted:
+        state[it["resource_id"]] = dict(by_path[it["path"]])
+    if adopted:
+        save_state(cfg["state_file"], state)
     new_items = [it for it in items if it["resource_id"] not in state]
     new_items.sort(key=lambda it: (
         semester_sort_key(it["path"], cfg["root_path"]),
@@ -427,7 +398,7 @@ def run_once(cfg):
     for item in new_items:
         try:
             with chat_action(cfg["telegram"], "upload_video"):
-                process_item(cfg, token, item, state, live_tag_map)
+                process_item(cfg, item, state, live_tag_map)
         except Exception:
             print(f"ERROR processing {item['path']}:", flush=True)
             traceback.print_exc()
@@ -439,7 +410,20 @@ def main():
     the whole suite runs under one systemd service instead of two."""
     cfg = load_config()
     os.makedirs(cfg["tmp_dir"], exist_ok=True)
-    run_once(cfg)
+    flag = cfg["state_file"] + ".fail_notified"
+    try:
+        run_once(cfg)
+    except Exception as e:
+        traceback.print_exc()
+        owner = os.environ.get("OWNER_TELEGRAM_ID")
+        if owner and not os.path.exists(flag):
+            detail = (getattr(e, "stderr", "") or str(e)).strip()[-300:]
+            tg_api(cfg["telegram"], "sendMessage", chat_id=owner,
+                   text=f"⚠️ Видео-бот не смог прочитать Google Диск:\n{detail}")
+            open(flag, "w").close()
+        return
+    if os.path.exists(flag):
+        os.remove(flag)
 
 
 if __name__ == "__main__":
