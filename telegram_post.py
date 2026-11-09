@@ -5,6 +5,7 @@ import os
 import sys
 from datetime import UTC, datetime, timedelta
 
+import ipv4_only  # noqa: F401
 import requests
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
@@ -121,7 +122,7 @@ def save_topics(topics):
 
 def tg_api(method, **params):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    resp = requests.post(url, data=params, timeout=30)
+    resp = requests.post(url, data=params, timeout=(10, 30))
     resp.raise_for_status()
     result = resp.json()
     if not result.get("ok"):

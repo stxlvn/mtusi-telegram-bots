@@ -18,6 +18,7 @@ import sys
 import time
 from urllib.parse import unquote, urlsplit
 
+import ipv4_only  # noqa: F401
 import requests
 
 import lms_scraper as ls

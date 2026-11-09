@@ -8,6 +8,7 @@ import sys
 import time
 from datetime import UTC, datetime, timedelta
 
+import ipv4_only  # noqa: F401
 import requests
 from dotenv import load_dotenv
 
@@ -193,7 +194,7 @@ def identity_matches(cfg, student_fio, user_id, participants):
 def tg_api(cfg, method, **params):
     url = f"https://api.telegram.org/bot{cfg['bot_token']}/{method}"
     data = {k: v for k, v in params.items() if v is not None}
-    resp = requests.post(url, data=data, timeout=30)
+    resp = requests.post(url, data=data, timeout=(10, 30))
     resp.raise_for_status()
     result = resp.json()
     if not result.get("ok"):
