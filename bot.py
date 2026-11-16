@@ -808,7 +808,8 @@ def handle_update(cfg, upd, roster, student_map, state, rollcall, participants):
     if is_private:
         return
 
-    if text.lower() in cfg["checkin_keywords"]:
+    replied = (msg.get("reply_to_message") or {}).get("message_id")
+    if text.lower() in cfg["checkin_keywords"] and replied in (None, thread_id):
         student = student_map.get(user_id)
         if student is None:
             tg_api(cfg, "sendMessage", chat_id=chat_id, message_thread_id=thread_id,
