@@ -64,6 +64,13 @@ JOIN_TEXT_RE = re.compile(
     r'<a[^>]+href="([^"]+)"[^>]*>\s*(?:<[^>]+>\s*)*'
     r'(?:Присоединиться|Войти в конференцию|Join session|Start session)', re.I)
 BBB_NOT_STARTED_RE = re.compile(r"собрание ещ[её] не начал", re.I)
+# The current Контур.Толк Moodle plugin no longer prints the ktalk.ru room on
+# the activity page, only a «Подключиться к сеансу» button to its own join.php
+# (seen 2026-11 on lms.mtuci.ru). Keep that LMS link as is rather than following
+# it: it logs each student in under their own account, while the resolved room
+# URL could carry the bot account's identity.
+KONTUR_JOIN_RE = re.compile(
+    r'href="(https://lms\.mtuci\.ru/(?:lms/)?mod/konturtalk/join\.php\?[^"]+)"', re.I)
 
 
 class LMSError(Exception):
@@ -212,6 +219,9 @@ def course_conf_link(sess, viewurl):
         k = KTALK_RE.search(mr.text)
         if k:
             return k.group(0)
+        kj = KONTUR_JOIN_RE.search(mr.text)
+        if kj:
+            return html.unescape(kj.group(1))
         tag = JOIN_TAG_RE.search(mr.text)
         if tag:
             href = re.search(r'href="([^"]+)"', tag.group(0))
