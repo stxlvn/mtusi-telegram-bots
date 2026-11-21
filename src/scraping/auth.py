@@ -140,10 +140,14 @@ class MTUCIAuthenticator:
                 self._logger.debug("Login form found, not authenticated")
                 return False
 
-            # Keycloak only redirects to /student after a successful login; the
-            # SPA there can take longer to render than we poll for.
-            if page.url.startswith("https://lk.mtuci.ru/student"):
-                self._logger.info("Landed on the student area")
+            # Keycloak only redirects into the cabinet after a successful login;
+            # the SPA there can take longer to render than we poll for. Accounts
+            # that haven't accepted the digital agreement land on
+            # /digital-agreement instead of /student (seen 2026-11 on a БАП2652
+            # account) — /student/schedule still opens fine from there.
+            if page.url.startswith(("https://lk.mtuci.ru/student",
+                                    "https://lk.mtuci.ru/digital-agreement")):
+                self._logger.info("Landed in the cabinet", url=page.url)
                 return True
 
             # Third check - look for the username in the header
