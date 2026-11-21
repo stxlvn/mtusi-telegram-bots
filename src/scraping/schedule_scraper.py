@@ -365,7 +365,7 @@ class ScheduleParser:
                 location=location,
                 start_time=datetime.combine(base_date.date(), start_time),
                 end_time=datetime.combine(base_date.date(), end_time),
-                group="БИК2404",  # TODO: Make configurable
+                group=os.environ.get("GROUP_LABEL") or "БИК2404",
             )
 
         except Exception as e:

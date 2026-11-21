@@ -33,7 +33,15 @@ LK_ATTENDANCE = os.path.join(SCRIPT_DIR, "lk_attendance.py")
 LK_LOG = os.path.join(DATA_DIR, "lk_attendance.log")
 VIDEO_BOT_SCRIPT = os.path.join(SCRIPT_DIR, "video_bot.py")
 VIDEO_BOT_LOG = os.path.join(DATA_DIR, "video_bot.log")
+# video_bot.py reads its config from ./data regardless of DATA_DIR
+VIDEO_BOT_CONFIG = os.path.join(SCRIPT_DIR, "data", "video_bot_config.json")
 VENV_PY = sys.executable
+
+# ATTENDANCE=off: no roll-call buttons, no /я registration, no «+» check-ins and
+# nothing sent to the lk.mtuci.ru attendance sheet (that needs a староста/curator
+# account). Lessons still open/close internally so conference links get rechecked.
+ATTENDANCE_ENABLED = os.environ.get("ATTENDANCE", "on").strip().lower() not in (
+    "0", "off", "false", "no")
 
 # daily jobs folded into the main loop (no cron); MSK HH:MM triggers
 LMS_SCRAPE_AT = (7, 35)
@@ -67,10 +75,12 @@ def _require_env(name):
 
 def load_config():
     os.makedirs(DATA_DIR, exist_ok=True)
+    owner = (os.environ.get("OWNER_TELEGRAM_ID") or "").strip()
     return {
         "bot_token": _require_env("TELEGRAM_BOT_TOKEN"),
         "chat_id": int(_require_env("TELEGRAM_CHAT_ID")),
-        "owner_telegram_id": int(_require_env("OWNER_TELEGRAM_ID")),
+        # optional: without it there is no admin panel and no DMs about failures
+        "owner_telegram_id": int(owner) if owner else None,
         "checkin_keywords": [k.strip().lower() for k in
                              os.environ.get("CHECKIN_KEYWORDS", "+,тут,здесь").split(",") if k.strip()],
         "roster_file": os.path.join(DATA_DIR, "roster.json"),
@@ -278,6 +288,10 @@ def build_lesson_checkin_keyboard(roster, present_uids):
 def open_lesson(cfg, lesson, roster):
     thread_id = ensure_topic(lesson["subject"])
     lesson["thread_id"] = thread_id
+    if not ATTENDANCE_ENABLED:
+        lesson["opened"] = True
+        print(f"lesson started: '{lesson['subject']}' (attendance off)", flush=True)
+        return
     end_time = datetime.fromisoformat(lesson["end"])
     result = schedule_tg_api(
         "sendMessage",
@@ -296,6 +310,10 @@ def open_lesson(cfg, lesson, roster):
 
 
 def close_lesson(cfg, lesson, roster):
+    if not ATTENDANCE_ENABLED:
+        lesson["closed"] = True
+        print(f"lesson ended: '{lesson['subject']}' (attendance off)", flush=True)
+        return
     present = set(lesson["present_uids"])
     present_fio = sorted(s["fio"] for s in roster if s["uid"] in present)
     absent_fio = sorted(s["fio"] for s in roster if s["uid"] not in present)
@@ -414,6 +432,13 @@ def handle_callback_query(cfg, cq, rollcall, roster, student_map, participants, 
             handle_conf_link_callback(cfg, cq, state)
         else:
             tg_api(cfg, "answerCallbackQuery", callback_query_id=cq["id"])
+        return
+
+    if not ATTENDANCE_ENABLED:
+        # stale roll-call buttons from before attendance was switched off
+        if data == "rc_taken" or data.startswith(("lc:", "rc:")):
+            tg_api(cfg, "answerCallbackQuery", callback_query_id=cq["id"],
+                   text="Отметка посещаемости в этом чате отключена.")
         return
 
     if data == "rc_taken":
@@ -699,6 +724,25 @@ def handle_owner_command(cfg, msg, roster, student_map, state, rollcall):
         state["pending_url_subject"] = None
         save_json(cfg["state_file"], state)
         reply = "Отменено."
+    elif cmd in ("/start", "/help") and not ATTENDANCE_ENABLED:
+        reply = (
+            "🔧 <b>Управление ботом</b>\n\n"
+            "/status — статус расписания и парсеров\n"
+            "/refresh — принудительно обновить расписание сейчас\n"
+            "/links — ссылки на конференции по предметам (кнопками)\n\n"
+            "Отметка посещаемости отключена (ATTENDANCE=off)."
+        )
+    elif cmd in ("/roster", "/close") and not ATTENDANCE_ENABLED:
+        reply = "Отметка посещаемости отключена (ATTENDANCE=off)."
+    elif cmd == "/status" and not ATTENDANCE_ENABLED:
+        lessons = state.get("lessons")
+        reply = (
+            f"Кеш расписания на: {state.get('date') or '—'}\n"
+            f"Пар сегодня в кеше: {len(lessons) if lessons is not None else '—'}\n"
+            f"Дайджест расписания постился: {state.get('last_digest') or '—'}\n"
+            f"Парсер LMS запускался: {state.get('last_lms_scrape') or '—'}\n"
+            f"Автопарсер LMS: {lms_status(cfg)}"
+        )
     elif cmd in ("/start", "/help"):
         reply = (
             "🔧 <b>Управление attendance-bot</b>\n\n"
@@ -779,7 +823,13 @@ def handle_update(cfg, upd, roster, student_map, state, rollcall, participants):
     if is_private and str(msg.get("from", {}).get("id")) == str(cfg.get("owner_telegram_id")):
         handle_owner_command(cfg, msg, roster, student_map, state, rollcall)
         return
+    if is_private and cfg.get("owner_telegram_id") is None:
+        # lets the admin find their id: DM the bot, read the service log
+        print(f"private message from id={msg.get('from', {}).get('id')} "
+              f"(set OWNER_TELEGRAM_ID to make them the admin)", flush=True)
     if not is_private and chat_id != cfg["chat_id"]:
+        return
+    if not ATTENDANCE_ENABLED:
         return
     text = (msg.get("text") or "").strip()
     user_id = str(msg.get("from", {}).get("id"))
@@ -838,7 +888,10 @@ def main():
     participants = load_participants(cfg)
     offset = load_offset(cfg)
 
-    print(f"bot started, roster={len(roster)} students, participants={len(participants)}", flush=True)
+    print(f"bot started, roster={len(roster)} students, "
+          f"participants={len(participants)}, "
+          f"attendance={'on' if ATTENDANCE_ENABLED else 'off'}, "
+          f"admin={'set' if cfg['owner_telegram_id'] else 'NOT SET'}", flush=True)
 
     while True:
         try:
@@ -854,7 +907,7 @@ def main():
                 if lesson["opened"] and not lesson["closed"] and now >= end:
                     close_lesson(cfg, lesson, roster)
                     changed = True
-                if (lesson["opened"] and not lesson["closed"]
+                if (ATTENDANCE_ENABLED and lesson["opened"] and not lesson["closed"]
                         and not lesson.get("lk_early_submitted")
                         and now >= end - LK_EARLY_SUBMIT_BEFORE_END):
                     lesson["lk_early_submitted"] = True
@@ -882,7 +935,7 @@ def main():
             due = (last_sheet_check is None or
                    (now - datetime.fromisoformat(last_sheet_check)).total_seconds()
                    >= LK_SHEET_CHECK_INTERVAL_SEC)
-            if lessons_pending and due:
+            if ATTENDANCE_ENABLED and lessons_pending and due:
                 state["last_lk_sheet_check"] = now.isoformat()
                 if check_lk_sheets(cfg, state):
                     save_json(cfg["state_file"], state)
@@ -909,7 +962,8 @@ def main():
                 spawn(SCHEDULE_SCRIPT, log=SCHEDULE_LOG)
 
             last_video_check = state.get("last_video_bot_check")
-            if (last_video_check is None or
+            # no config = video bot not set up here; don't spawn it to crash every 5 min
+            if os.path.exists(VIDEO_BOT_CONFIG) and (last_video_check is None or
                     (now - datetime.fromisoformat(last_video_check)).total_seconds()
                     >= VIDEO_BOT_POLL_INTERVAL_SEC):
                 state["last_video_bot_check"] = now.isoformat()
